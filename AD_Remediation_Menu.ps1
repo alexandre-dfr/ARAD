@@ -33,6 +33,16 @@ $Script:SimulationMode = $true
 $Script:LogDir  = Join-Path -Path $PSScriptRoot -ChildPath "Logs"
 $Script:LogFile = Join-Path -Path $Script:LogDir -ChildPath ("Remediation_AD_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
 $Script:QuarantineOUName = "OU_QUARANTAINE_COMPTES_INACTIFS"
+$Script:DisableUserOUName = "disable_user"
+$Script:DisableComputerOUName = "disable_computer"
+# Groupes a privileges exclus PAR DEFAUT (jamais desactives/deplaces) des actions de
+# desactivation par date/anciennete. Des groupes supplementaires (comptes de service,
+# VIP...) peuvent etre ajoutes de maniere interactive au moment de l'action.
+$Script:DefaultExcludedGroups = @(
+    "Domain Admins", "Enterprise Admins", "Schema Admins", "Administrators",
+    "Account Operators", "Backup Operators", "Server Operators", "Print Operators",
+    "Group Policy Creator Owners", "Protected Users", "DnsAdmins", "Cert Publishers"
+)
 
 if (-not (Test-Path $Script:LogDir)) {
     New-Item -Path $Script:LogDir -ItemType Directory -Force | Out-Null
@@ -179,6 +189,51 @@ function Get-DomainControllersList {
     }
 }
 
+function Test-DCWinRmConnectivity {
+    <#
+        Verifie que le PowerShell Remoting (WinRM) repond sur chaque serveur AVANT
+        de lancer une action a distance dessus. Sans ce controle prealable, un DC
+        injoignable produit une erreur de connexion NON BLOQUANTE (Invoke-Command
+        sans -ErrorAction Stop) qui s'affiche en rouge mais n'empeche pas le script
+        de logguer "Termine (OK)" a tort. Permet d'ecarter proprement les serveurs
+        injoignables, avec un message de diagnostic actionnable, plutot que de
+        laisser echouer chaque commande distante une par une.
+    #>
+    param([Parameter(Mandatory)][string[]]$ComputerNames)
+
+    $reachable = @()
+    $unreachable = @()
+    foreach ($name in $ComputerNames) {
+        try {
+            Test-WSMan -ComputerName $name -ErrorAction Stop | Out-Null
+            $reachable += $name
+        } catch {
+            $unreachable += $name
+        }
+    }
+
+    if ($unreachable.Count -gt 0) {
+        Write-Log ("PowerShell Remoting (WinRM) injoignable sur : {0}. Ces serveurs seront ignores pour cette action." -f ($unreachable -join ', ')) -Level WARN
+        Write-Log "A verifier sur ces serveurs : service WinRM demarre ('winrm quickconfig' ou 'Enable-PSRemoting -Force'), regle de pare-feu 'Gestion a distance de Windows (HTTP-In)' active sur le profil reseau utilise, resolution DNS du nom, et serveur bien allume/joignable sur le reseau." -Level WARN
+    }
+
+    return [PSCustomObject]@{ Reachable = $reachable; Unreachable = $unreachable }
+}
+
+function Add-DisabledMarkerToDescription {
+    <#
+        Ajoute (sans ecraser une description existante) la mention "Desactive le :
+        <date>" sur un objet utilisateur/ordinateur desactive, pour tracer
+        directement dans l'annuaire QUAND l'objet a ete desactive par le script.
+    #>
+    param([Parameter(Mandatory)][string]$Identity)
+
+    $marker = "Desactive le : {0}" -f (Get-Date -Format "dd/MM/yyyy")
+    $obj = Get-ADObject -Identity $Identity -Properties Description
+    $newDescription = if ([string]::IsNullOrWhiteSpace($obj.Description)) { $marker } else { "$($obj.Description) | $marker" }
+    Set-ADObject -Identity $Identity -Replace @{ Description = $newDescription }
+}
+
 function New-RandomComplexPassword {
     param([int]$Length = 32)
     $chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*()-_=+'
@@ -213,6 +268,128 @@ function Read-InactivityThresholds {
         UserDays     = [int]$u
         ComputerDays = [int]$c
     }
+}
+
+# ============================================================
+#  GARDE-FOUS PARTAGES (exclusions OU/groupes, comptes systeme proteges)
+#  Utilises par les actions de desactivation par date/anciennete, en mode
+#  interactif ET dans le script autonome deploye pour l'automatisation.
+# ============================================================
+
+function Get-AlwaysProtectedPrincipalSids {
+    <#
+        Comptes systeme JAMAIS desactivables/deplacables, quels que soient les
+        choix de l'utilisateur : krbtgt, Administrateur et Invite integres
+        (RID bien connus 500/501/502, valables sur tout domaine AD), et le
+        compte qui execute le script lui-meme (pour ne jamais se desactiver soi-meme).
+    #>
+    $sids = New-Object System.Collections.Generic.HashSet[string]
+    try {
+        $domainSidStr = (Get-ADDomain).DomainSID.Value
+        foreach ($rid in 500, 501, 502) {
+            try {
+                $obj = Get-ADObject -LDAPFilter "(objectSid=$domainSidStr-$rid)" -ErrorAction SilentlyContinue
+                if ($obj) { [void]$sids.Add($obj.ObjectSID.Value) }
+            } catch { }
+        }
+    } catch { }
+
+    try {
+        $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
+        [void]$sids.Add($currentUser.User.Value)
+    } catch { }
+
+    return $sids
+}
+
+function Get-ProtectedDCComputerDNs {
+    # Les controleurs de domaine ne doivent jamais etre desactives/deplaces.
+    $dns = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($dc in (Get-DomainControllersList)) {
+        try { [void]$dns.Add((Get-ADComputer -Identity $dc.Name).DistinguishedName) } catch { }
+    }
+    return $dns
+}
+
+function Get-ExpandedGroupMemberSids {
+    param([string[]]$GroupNames)
+    $sids = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($g in $GroupNames) {
+        if ([string]::IsNullOrWhiteSpace($g)) { continue }
+        try {
+            Get-ADGroupMember -Identity $g -Recursive -ErrorAction Stop | ForEach-Object { [void]$sids.Add($_.SID.Value) }
+        } catch {
+            Write-Log ("Groupe d'exclusion '{0}' introuvable ou inaccessible - ignore." -f $g) -Level WARN
+        }
+    }
+    return $sids
+}
+
+function Select-ExclusionOUs {
+    <#
+        Garde-fou : permet d'exclure certaines UO (comptes de service, serveurs
+        critiques, postes VIP...) des actions de desactivation par date/anciennete.
+    #>
+    param([Parameter(Mandatory)][string]$Label)
+
+    $ous = @(Get-ADOrganizationalUnit -Filter * -ErrorAction SilentlyContinue | Sort-Object DistinguishedName)
+    if (-not $ous) { return @() }
+
+    Write-Host ""
+    Write-Host ("UO disponibles a EXCLURE pour {0} :" -f $Label) -ForegroundColor DarkGray
+    for ($i = 0; $i -lt $ous.Count; $i++) { Write-Host ("  [{0}] {1}" -f $i, $ous[$i].DistinguishedName) }
+    $sel = Read-Host ("Numeros des UO a exclure pour {0}, separes par une virgule (vide = aucune exclusion)" -f $Label)
+    if ([string]::IsNullOrWhiteSpace($sel)) { return @() }
+
+    $idx = @($sel -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ } | Where-Object { $_ -lt $ous.Count })
+    return @($idx | ForEach-Object { $ous[$_].DistinguishedName })
+}
+
+function Read-ExtraExclusionGroups {
+    <#
+        Garde-fou : membres de ces groupes jamais desactives/deplaces (ex : comptes
+        admin). Une liste de groupes a privileges est exclue par defaut ; des groupes
+        supplementaires (comptes de service, VIP...) peuvent etre ajoutes.
+    #>
+    Write-Host ""
+    Write-Host "Groupes EXCLUS par defaut (jamais desactives/deplaces) :" -ForegroundColor DarkGray
+    $Script:DefaultExcludedGroups | ForEach-Object { Write-Host ("  - {0}" -f $_) -ForegroundColor DarkGray }
+
+    $extraInput = Read-Host "Groupes SUPPLEMENTAIRES a exclure, noms separes par une virgule (vide = aucun)"
+    $extra = @()
+    if (-not [string]::IsNullOrWhiteSpace($extraInput)) {
+        $extra = @($extraInput -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        foreach ($g in $extra) {
+            if (-not (Get-ADGroup -Filter "Name -eq '$g'" -ErrorAction SilentlyContinue)) {
+                Write-Log ("Groupe '{0}' introuvable dans l'annuaire - il sera ignore lors du filtrage." -f $g) -Level WARN
+            }
+        }
+    }
+
+    return @($Script:DefaultExcludedGroups + $extra | Select-Object -Unique)
+}
+
+function Read-DisableCutoffDate {
+    param([Parameter(Mandatory)][string]$Label)
+    $dateInput = Read-Host ("Desactiver {0} dont la derniere connexion est ANTERIEURE au (format jj/mm/aaaa)" -f $Label)
+    $formats = @("dd/MM/yyyy", "d/M/yyyy", "yyyy-MM-dd")
+    $parsed = [datetime]::MinValue
+    $ok = $false
+    foreach ($fmt in $formats) {
+        if ([datetime]::TryParseExact($dateInput, $fmt, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$parsed)) {
+            $ok = $true
+            break
+        }
+    }
+    if (-not $ok) {
+        Write-Log ("Date invalide : '{0}'. Format attendu jj/mm/aaaa." -f $dateInput) -Level ERROR
+        return $null
+    }
+    if ($parsed -gt (Get-Date)) {
+        Write-Host "Cette date est dans le futur : tous les comptes actifs correspondants seraient concernes." -ForegroundColor Yellow
+        if ((Read-Host "Continuer avec cette date future ? (O/N)") -notmatch '^[oOyY]') { return $null }
+    }
+    return $parsed
 }
 
 # ============================================================
@@ -322,6 +499,9 @@ function Invoke-SafeEnableDCAuditPolicy {
 
     $dcs = Get-DomainControllersList
     if (-not $dcs) { return }
+    $wr = Test-DCWinRmConnectivity -ComputerNames $dcs.HostName
+    $dcs = @($dcs | Where-Object { $wr.Reachable -contains $_.HostName })
+    if (-not $dcs) { Write-Log "Aucun DC joignable via PowerShell Remoting (WinRM), action annulee." -Level ERROR; return }
 
     # Les sous-categories sont ciblees par GUID (identifiant stable, independant de la langue
     # de l'OS). Passer le NOM anglais a auditpol echoue avec l'erreur 0x57 "Parametre incorrect"
@@ -361,7 +541,7 @@ function Invoke-SafeEnableDCAuditPolicy {
                         Success = ($LASTEXITCODE -eq 0)
                     }
                 }
-            } -ArgumentList (,$subcategories)
+            } -ArgumentList (,$subcategories) -ErrorAction Stop
 
             $failed = @($results | Where-Object { -not $_.Success })
             if ($failed.Count -gt 0) {
@@ -384,6 +564,9 @@ function Invoke-SafeEnableNtlmAudit {
 
     $dcs = Get-DomainControllersList
     if (-not $dcs) { return }
+    $wr = Test-DCWinRmConnectivity -ComputerNames $dcs.HostName
+    $dcs = @($dcs | Where-Object { $wr.Reachable -contains $_.HostName })
+    if (-not $dcs) { Write-Log "Aucun DC joignable via PowerShell Remoting (WinRM), action annulee." -Level ERROR; return }
     $dcs | ForEach-Object { Write-Host ("  - {0}" -f $_.HostName) }
 
     if (-not (Confirm-Action "Activer l'audit NTLM (registre + journal NTLM Operational) sur ces DC")) { return }
@@ -402,7 +585,7 @@ function Invoke-SafeEnableNtlmAudit {
                 Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters" -Name "AuditNTLMInDomain" -Value 1 -Type DWord
 
                 & wevtutil.exe set-log "Microsoft-Windows-NTLM/Operational" /enabled:true /quiet | Out-Null
-            }
+            } -ErrorAction Stop
         }
     }
 
@@ -460,9 +643,138 @@ function Invoke-SafeClearPasswordNotRequired {
     }
 }
 
+function Invoke-SafeEnableWinRmViaGPO {
+    <#
+        Active PowerShell Remoting (WinRM) sur les DC via une GPO liee a l'OU
+        Domain Controllers : fonctionne MEME SI WinRM est actuellement desactive
+        sur la cible, car une GPO est recuperee par le client via SYSVOL/LDAP au
+        prochain rafraichissement, sans dependre du remoting lui-meme (contrairement
+        a Invoke-Command, qui necessite que WinRM soit deja actif).
+        Prise en compte : au prochain rafraichissement de GPO (gpupdate /force ou
+        cycle normal) ET un redemarrage du service WinRM (ou du serveur) pour que
+        le nouveau listener HTTP soit cree.
+    #>
+    if (-not (Get-Module -ListAvailable -Name GroupPolicy)) {
+        Write-Log "Le module GroupPolicy (RSAT-GPMC) n'est pas installe sur ce poste." -Level ERROR
+        return
+    }
+    Import-Module GroupPolicy -ErrorAction SilentlyContinue
+
+    $gpoName = "ADHC - Activation WinRM sur les DC"
+    $ouDCs = "OU=Domain Controllers,$((Get-ADDomain).DistinguishedName)"
+
+    if (-not (Confirm-Action ("Creer/lier la GPO '{0}' sur l'OU Domain Controllers (service WinRM + listener + regle de pare-feu)" -f $gpoName))) { return }
+
+    Invoke-Guarded -Description "Creation/MAJ GPO activation WinRM" -Action {
+        $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+        if (-not $gpo) { $gpo = New-GPO -Name $gpoName }
+
+        # Demarrage automatique du service WinRM (Group Policy Preferences - registre)
+        Set-GPPrefRegistryValue -Name $gpoName -Context Computer -Key "HKLM\SYSTEM\CurrentControlSet\Services\WinRM" -ValueName "Start" -Type DWord -Value 2 -Action Update | Out-Null
+
+        # Policy "Allow remote server management through WinRM" : cree automatiquement le
+        # listener HTTP sur toutes les IP au demarrage du service (equivalent 'winrm quickconfig'
+        # sans avoir besoin d'executer la commande localement sur le DC).
+        Set-GPRegistryValue -Name $gpoName -Key "HKLM\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service" -ValueName "AllowAutoConfig" -Type DWord -Value 1
+        Set-GPRegistryValue -Name $gpoName -Key "HKLM\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service" -ValueName "IPv4Filter" -Type String -Value "*"
+        Set-GPRegistryValue -Name $gpoName -Key "HKLM\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service" -ValueName "IPv6Filter" -Type String -Value "*"
+
+        # Regle de pare-feu HTTP-In (5985) poussee directement dans la GPO (module NetSecurity),
+        # sans passer par le DC lui-meme.
+        try {
+            $gpoSession = Open-NetGPO -PolicyStore ("{0}\{1}" -f (Get-ADDomain).DNSRoot, $gpoName) -ErrorAction Stop
+            if (-not (Get-NetFirewallRule -GPOSession $gpoSession -Name "ADHC-WINRM-HTTP-In-TCP" -ErrorAction SilentlyContinue)) {
+                New-NetFirewallRule -GPOSession $gpoSession -Name "ADHC-WINRM-HTTP-In-TCP" -DisplayName "Windows Remote Management (HTTP-In) - ADHC" -Direction Inbound -Protocol TCP -LocalPort 5985 -Action Allow -Profile Domain, Private -Enabled True | Out-Null
+            }
+            Save-NetGPO -GPOSession $gpoSession
+        } catch {
+            Write-Log ("Regle de pare-feu non creee automatiquement (module NetSecurity indisponible ou droits insuffisants) : {0}. A activer manuellement dans la GPO : Configuration ordinateur > Parametres Windows > Parametres de securite > Pare-feu Windows avec fonctions avancees de securite > Regles de trafic entrant > activer le groupe predefini 'Gestion a distance de Windows'." -f $_.Exception.Message) -Level WARN
+        }
+
+        try { New-GPLink -Name $gpoName -Target $ouDCs -ErrorAction Stop | Out-Null } catch { }
+    }
+
+    Write-Log "GPO liee sur l'OU Domain Controllers. Prise en compte au prochain rafraichissement de GPO SUR CHAQUE DC (gpupdate /force ou cycle normal), puis un redemarrage du service WinRM (ou du serveur) est necessaire pour que le nouveau listener soit cree." -Level WARN
+}
+
+function Invoke-SafeEnableWinRmViaWmi {
+    <#
+        Active WinRM IMMEDIATEMENT sur les DC indiques, sans attendre un cycle de
+        GPO, en executant 'winrm quickconfig' a distance via WMI/DCOM (RPC) plutot
+        que via WinRM lui-meme - utile car WMI/DCOM est souvent deja joignable
+        (regles de pare-feu AD par defaut) meme quand WinRM ne l'est pas encore.
+    #>
+    param([Parameter(Mandatory)][string[]]$ComputerNames)
+
+    foreach ($name in $ComputerNames) {
+        Invoke-Guarded -Description ("Activation immediate de WinRM sur {0} via WMI/DCOM" -f $name) -Action {
+            $cimOption = New-CimSessionOption -Protocol Dcom
+            $cim = New-CimSession -ComputerName $name -SessionOption $cimOption -ErrorAction Stop
+            try {
+                Invoke-CimMethod -CimSession $cim -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = "cmd.exe /c winrm.cmd quickconfig -quiet -force" } -ErrorAction Stop | Out-Null
+                Start-Sleep -Seconds 5
+                Invoke-CimMethod -CimSession $cim -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = 'netsh advfirewall firewall set rule group="Windows Remote Management" new enable=yes' } -ErrorAction Stop | Out-Null
+                Start-Sleep -Seconds 3
+            } finally {
+                Remove-CimSession -CimSession $cim
+            }
+
+            if (-not (Test-WSMan -ComputerName $name -ErrorAction SilentlyContinue)) {
+                throw "WinRM reste injoignable sur $name apres la tentative via WMI (la commande a ete lancee, mais son resultat n'a pas pu etre confirme dans le delai imparti - relancez un test de connectivite dans quelques instants)."
+            }
+        }
+    }
+}
+
+function Invoke-SafeEnableWinRmOnDCs {
+    Write-Host "`n--- Activer PowerShell Remoting (WinRM) sur les controleurs de domaine ---" -ForegroundColor Cyan
+    Write-Host "Impact : AUCUN sur l'existant. Active uniquement la gestion a distance, necessaire pour" -ForegroundColor DarkGray
+    Write-Host "         toutes les actions distantes de ce script (auditpol, audit NTLM, Spooler," -ForegroundColor DarkGray
+    Write-Host "         signature LDAP, rotation KRBTGT, automatisation...)." -ForegroundColor DarkGray
+
+    $dcs = Get-DomainControllersList
+    if (-not $dcs) { return }
+
+    $wr = Test-DCWinRmConnectivity -ComputerNames $dcs.HostName
+    if ($wr.Unreachable.Count -eq 0) {
+        Write-Log "WinRM est deja joignable sur tous les DC." -Level OK
+        return
+    }
+
+    Write-Host ("DC actuellement INJOIGNABLES en WinRM : {0}" -f ($wr.Unreachable -join ', ')) -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Deux methodes disponibles (non exclusives) :" -ForegroundColor Yellow
+    Write-Host "  [1] Via GPO (recommande) : fonctionne meme si WinRM est totalement a l'arret sur la" -ForegroundColor DarkGray
+    Write-Host "      cible (pousse par SYSVOL/LDAP, pas par WinRM). Prise en compte DIFFEREE : prochain" -ForegroundColor DarkGray
+    Write-Host "      rafraichissement de GPO + redemarrage du service WinRM (ou du serveur)." -ForegroundColor DarkGray
+    Write-Host "  [2] Immediate via WMI/DCOM : active WinRM tout de suite sur les DC choisis, mais" -ForegroundColor DarkGray
+    Write-Host "      necessite que WMI/DCOM (RPC) soit lui-meme joignable vers ces DC." -ForegroundColor DarkGray
+    $method = Read-Host "Methode a utiliser [1=GPO / 2=Immediate WMI / 3=Les deux] (defaut 1)"
+    if ([string]::IsNullOrWhiteSpace($method)) { $method = "1" }
+
+    if ($method -eq "1" -or $method -eq "3") {
+        Invoke-SafeEnableWinRmViaGPO
+    }
+
+    if ($method -eq "2" -or $method -eq "3") {
+        if (-not (Confirm-Action ("Tenter l'activation IMMEDIATE de WinRM via WMI/DCOM sur : {0}" -f ($wr.Unreachable -join ', ')))) { return }
+        Invoke-SafeEnableWinRmViaWmi -ComputerNames $wr.Unreachable
+
+        Write-Host ""
+        Write-Host "Nouvelle verification de connectivite WinRM..." -ForegroundColor DarkGray
+        $recheck = Test-DCWinRmConnectivity -ComputerNames $wr.Unreachable
+        if ($recheck.Unreachable.Count -eq 0) {
+            Write-Log "WinRM est maintenant joignable sur tous les DC precedemment injoignables." -Level OK
+        } else {
+            Write-Log ("Toujours injoignables apres tentative WMI : {0}. WMI/DCOM peut lui aussi etre bloque par le pare-feu, ou le compte courant manque de droits locaux sur ces DC - verifiez manuellement." -f ($recheck.Unreachable -join ', ')) -Level WARN
+        }
+    }
+}
+
 function Invoke-SafeAll {
     Write-Host "`n=== Execution de toutes les actions SAFE ===" -ForegroundColor Cyan
     if (-not (Confirm-Action "Lancer l'ensemble des actions SAFE listees ci-dessus, une par une")) { return }
+    Invoke-SafeEnableWinRmOnDCs
     Invoke-SafeEnableRecycleBin
     Invoke-SafeDisableGuest
     Invoke-SafeProtectOUs
@@ -560,7 +872,7 @@ function Grant-KrbtgtResetPermission {
         Invoke-Command -ComputerName $TargetDC -ScriptBlock {
             param($dn, $account)
             & dsacls.exe "$dn" /G "${account}:CA;Reset Password" | Out-Null
-        } -ArgumentList $krbtgtDN, "$domainNetbios\$PrincipalSam"
+        } -ArgumentList $krbtgtDN, "$domainNetbios\$PrincipalSam" -ErrorAction Stop
     }
 }
 
@@ -689,7 +1001,7 @@ function Invoke-RiskySetupKrbtgtScheduledRotation {
             if (-not (Test-ADServiceAccount -Identity $name)) {
                 throw "Le test du gMSA a echoue (Test-ADServiceAccount)."
             }
-        } -ArgumentList $gmsaName
+        } -ArgumentList $gmsaName -ErrorAction Stop
     }
 
     Grant-KrbtgtResetPermission -PrincipalSam "$gmsaName$" -TargetDC $targetDC
@@ -701,7 +1013,7 @@ function Invoke-RiskySetupKrbtgtScheduledRotation {
             $dir = "C:\ADHC-Scripts"
             if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
             Set-Content -Path (Join-Path $dir "Reset-KrbtgtScheduled.ps1") -Value $content -Encoding UTF8
-        } -ArgumentList $scriptContent
+        } -ArgumentList $scriptContent -ErrorAction Stop
     }
 
     Invoke-Guarded -Description ("Creation de la tache planifiee (tous les {0} jours) sur {1}" -f $days, $targetDC) -Action {
@@ -715,7 +1027,7 @@ function Invoke-RiskySetupKrbtgtScheduledRotation {
 
             Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
             Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description "Rotation automatique du mot de passe KRBTGT - deploye par le script de remediation AD"
-        } -ArgumentList $gmsaName, $domainNetbios, $days
+        } -ArgumentList $gmsaName, $domainNetbios, $days -ErrorAction Stop
     }
 
     Write-Log ("Tache planifiee 'ADHC - Rotation KRBTGT' creee sur {0}, execution tous les {1} jours a 02:00, sous le compte {2}\{3}$." -f $targetDC, $days, $domainNetbios, $gmsaName) -Level OK
@@ -904,6 +1216,9 @@ function Invoke-RiskyDisableSpoolerOnDCs {
 
     $dcs = Get-DomainControllersList
     if (-not $dcs) { return }
+    $wr = Test-DCWinRmConnectivity -ComputerNames $dcs.HostName
+    $dcs = @($dcs | Where-Object { $wr.Reachable -contains $_.HostName })
+    if (-not $dcs) { Write-Log "Aucun DC joignable via PowerShell Remoting (WinRM), action annulee." -Level ERROR; return }
     $dcs | ForEach-Object { Write-Host ("  - {0}" -f $_.HostName) }
 
     Write-Host ""
@@ -962,7 +1277,7 @@ function Invoke-RiskyDisableSpoolerOnDCs {
             Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
                 Stop-Service -Name Spooler -Force -ErrorAction Stop
                 Set-Service -Name Spooler -StartupType Disabled
-            }
+            } -ErrorAction Stop
         }
     }
 }
@@ -975,6 +1290,9 @@ function Invoke-RiskyEnforceLdapSigning {
 
     $dcs = Get-DomainControllersList
     if (-not $dcs) { return }
+    $wr = Test-DCWinRmConnectivity -ComputerNames $dcs.HostName
+    $dcs = @($dcs | Where-Object { $wr.Reachable -contains $_.HostName })
+    if (-not $dcs) { Write-Log "Aucun DC joignable via PowerShell Remoting (WinRM), action annulee." -Level ERROR; return }
 
     if (-not (Confirm-Action "Forcer LDAPServerIntegrity=2 (Require signing) et LdapEnforceChannelBinding=2 sur tous les DC" -Strong)) { return }
 
@@ -983,7 +1301,7 @@ function Invoke-RiskyEnforceLdapSigning {
             Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
                 Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters" -Name "LDAPServerIntegrity" -Value 2 -Type DWord
                 Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters" -Name "LdapEnforceChannelBinding" -Value 2 -Type DWord
-            }
+            } -ErrorAction Stop
         }
     }
     Write-Log "Redemarrage du service NTDS (ou du DC) requis pour prise en compte complete." -Level WARN
@@ -1050,14 +1368,136 @@ function Invoke-RiskyDisableInactiveAccounts {
     foreach ($u in $inactiveUsers) {
         Invoke-Guarded -Description ("Quarantaine + desactivation utilisateur {0}" -f $u.SamAccountName) -Action {
             Disable-ADAccount -Identity $u.DistinguishedName
+            Add-DisabledMarkerToDescription -Identity $u.DistinguishedName
             Move-ADObject -Identity $u.DistinguishedName -TargetPath $quarantineDN
         }
     }
     foreach ($c in $inactiveComputers) {
         Invoke-Guarded -Description ("Quarantaine + desactivation ordinateur {0}" -f $c.SamAccountName) -Action {
             Disable-ADAccount -Identity $c.DistinguishedName
+            Add-DisabledMarkerToDescription -Identity $c.DistinguishedName
             Move-ADObject -Identity $c.DistinguishedName -TargetPath $quarantineDN
         }
+    }
+}
+
+function Invoke-RiskyDisableByDate {
+    Write-Host "`n--- Desactivation des postes/serveurs ET/OU utilisateurs a partir d'une DATE choisie ---" -ForegroundColor Red
+    Write-Host "Comme pour la desactivation par anciennete (option 11), les comptes sont DEPLACES vers" -ForegroundColor DarkGray
+    Write-Host ("une UO dediee ('{0}' pour les utilisateurs, '{1}' pour les postes/serveurs) ET DESACTIVES -" -f $Script:DisableUserOUName, $Script:DisableComputerOUName) -ForegroundColor DarkGray
+    Write-Host "jamais supprimes." -ForegroundColor DarkGray
+    Write-Host "Garde-fous TOUJOURS actifs, non desactivables : krbtgt, comptes Administrateur/Invite" -ForegroundColor DarkGray
+    Write-Host "integres, controleurs de domaine, et le compte qui execute ce script." -ForegroundColor DarkGray
+
+    $applyUsers = (Read-Host "Desactiver les UTILISATEURS inactifs depuis cette date ? (O/N)") -match '^[oOyY]'
+    $applyComputers = (Read-Host "Desactiver les POSTES/SERVEURS inactifs depuis cette date ? (O/N)") -match '^[oOyY]'
+    if (-not $applyUsers -and -not $applyComputers) { Write-Log "Aucun perimetre selectionne, action annulee." -Level WARN; return }
+
+    $cutoffUsers = $null
+    $cutoffComputers = $null
+    if ($applyUsers) {
+        $cutoffUsers = Read-DisableCutoffDate -Label "les UTILISATEURS"
+        if (-not $cutoffUsers) { return }
+    }
+    if ($applyComputers) {
+        $cutoffComputers = Read-DisableCutoffDate -Label "les POSTES/SERVEURS"
+        if (-not $cutoffComputers) { return }
+    }
+
+    $excludedOUsUsers = @()
+    $excludedOUsComputers = @()
+    if ($applyUsers) { $excludedOUsUsers = @(Select-ExclusionOUs -Label "les UTILISATEURS") }
+    if ($applyComputers) { $excludedOUsComputers = @(Select-ExclusionOUs -Label "les POSTES/SERVEURS") }
+    $excludedGroups = @(Read-ExtraExclusionGroups)
+
+    $protectedSids = Get-AlwaysProtectedPrincipalSids
+    $protectedSids.UnionWith((Get-ExpandedGroupMemberSids -GroupNames $excludedGroups))
+    $protectedComputerDNs = Get-ProtectedDCComputerDNs
+
+    $domainDN = (Get-ADDomain).DistinguishedName
+    $disableUserOUDN = "OU=$Script:DisableUserOUName,$domainDN"
+    $disableComputerOUDN = "OU=$Script:DisableComputerOUName,$domainDN"
+
+    $selectedUsers = @()
+    $skippedUsers = @()
+    if ($applyUsers) {
+        $candidates = @(Get-ADUser -Filter { (Enabled -eq $true) -and (LastLogonTimestamp -lt $cutoffUsers) } -Properties LastLogonTimestamp, SID)
+        foreach ($u in $candidates) {
+            $reason = $null
+            if ($protectedSids.Contains($u.SID.Value)) { $reason = "compte protege (systeme/groupe exclu)" }
+            elseif ($excludedOUsUsers | Where-Object { $u.DistinguishedName -like "*,$_" }) { $reason = "UO exclue" }
+            elseif ($u.DistinguishedName -like "*,$disableUserOUDN" -or $u.DistinguishedName -like "*,$disableComputerOUDN") { $reason = "deja en quarantaine" }
+
+            if ($reason) { $skippedUsers += [PSCustomObject]@{ SamAccountName = $u.SamAccountName; Type = 'User'; Raison = $reason } }
+            else { $selectedUsers += $u }
+        }
+    }
+
+    $selectedComputers = @()
+    $skippedComputers = @()
+    if ($applyComputers) {
+        $candidates = @(Get-ADComputer -Filter { (Enabled -eq $true) -and (LastLogonTimestamp -lt $cutoffComputers) } -Properties LastLogonTimestamp, SID)
+        foreach ($c in $candidates) {
+            $reason = $null
+            if ($protectedSids.Contains($c.SID.Value)) { $reason = "compte protege (systeme/groupe exclu)" }
+            elseif ($protectedComputerDNs.Contains($c.DistinguishedName)) { $reason = "controleur de domaine" }
+            elseif ($excludedOUsComputers | Where-Object { $c.DistinguishedName -like "*,$_" }) { $reason = "UO exclue" }
+            elseif ($c.DistinguishedName -like "*,$disableUserOUDN" -or $c.DistinguishedName -like "*,$disableComputerOUDN") { $reason = "deja en quarantaine" }
+
+            if ($reason) { $skippedComputers += [PSCustomObject]@{ SamAccountName = $c.SamAccountName; Type = 'Computer'; Raison = $reason } }
+            else { $selectedComputers += $c }
+        }
+    }
+
+    Write-Host ""
+    Write-Host ("Utilisateurs a desactiver+deplacer : {0} (dont {1} exclu(s) par garde-fou)" -f $selectedUsers.Count, $skippedUsers.Count) -ForegroundColor Yellow
+    Write-Host ("Postes/Serveurs a desactiver+deplacer : {0} (dont {1} exclu(s) par garde-fou)" -f $selectedComputers.Count, $skippedComputers.Count) -ForegroundColor Yellow
+
+    $exportPath = Join-Path $Script:LogDir ("Desactivation_ParDate_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    @($selectedUsers | Select-Object SamAccountName, @{N='Type';E={'User'}}, @{N='Action';E={'Desactive+deplace'}}) +
+    @($selectedComputers | Select-Object SamAccountName, @{N='Type';E={'Computer'}}, @{N='Action';E={'Desactive+deplace'}}) +
+    @($skippedUsers | Select-Object SamAccountName, Type, @{N='Action';E={"Exclu : $($_.Raison)"}}) +
+    @($skippedComputers | Select-Object SamAccountName, Type, @{N='Action';E={"Exclu : $($_.Raison)"}}) |
+        Export-Csv -Path $exportPath -NoTypeInformation -Encoding UTF8
+    Write-Log ("Liste (incluant les exclusions, pour audit) exportee : {0}" -f $exportPath) -Level OK
+
+    if ($selectedUsers.Count -eq 0 -and $selectedComputers.Count -eq 0) { Write-Log "Aucun compte a traiter apres application des garde-fous." -Level OK; return }
+
+    if (-not (Confirm-Action "Deplacer en quarantaine ET desactiver tous les comptes listes ci-dessus (hors exclusions)" -Strong)) { return }
+
+    if ($selectedUsers.Count -gt 0) {
+        Invoke-Guarded -Description ("Creation de l'UO '{0}' (si absente)" -f $Script:DisableUserOUName) -Action {
+            if (-not (Get-ADOrganizationalUnit -Filter "Name -eq '$Script:DisableUserOUName'" -SearchBase $domainDN -ErrorAction SilentlyContinue)) {
+                New-ADOrganizationalUnit -Name $Script:DisableUserOUName -Path $domainDN -ProtectedFromAccidentalDeletion $true
+            }
+        }
+        foreach ($u in $selectedUsers) {
+            Invoke-Guarded -Description ("Quarantaine + desactivation utilisateur {0}" -f $u.SamAccountName) -Action {
+                Disable-ADAccount -Identity $u.DistinguishedName
+                Add-DisabledMarkerToDescription -Identity $u.DistinguishedName
+                Move-ADObject -Identity $u.DistinguishedName -TargetPath $disableUserOUDN
+            }
+        }
+    }
+
+    if ($selectedComputers.Count -gt 0) {
+        Invoke-Guarded -Description ("Creation de l'UO '{0}' (si absente)" -f $Script:DisableComputerOUName) -Action {
+            if (-not (Get-ADOrganizationalUnit -Filter "Name -eq '$Script:DisableComputerOUName'" -SearchBase $domainDN -ErrorAction SilentlyContinue)) {
+                New-ADOrganizationalUnit -Name $Script:DisableComputerOUName -Path $domainDN -ProtectedFromAccidentalDeletion $true
+            }
+        }
+        foreach ($c in $selectedComputers) {
+            Invoke-Guarded -Description ("Quarantaine + desactivation poste/serveur {0}" -f $c.SamAccountName) -Action {
+                Disable-ADAccount -Identity $c.DistinguishedName
+                Add-DisabledMarkerToDescription -Identity $c.DistinguishedName
+                Move-ADObject -Identity $c.DistinguishedName -TargetPath $disableComputerOUDN
+            }
+        }
+    }
+
+    Write-Host ""
+    if ((Read-Host "Voulez-vous automatiser cette desactivation via une tache planifiee recurrente ? (O/N)") -match '^[oOyY]') {
+        Invoke-AutomationSetupScheduledTask
     }
 }
 
@@ -1224,6 +1664,387 @@ function Invoke-ReportAll {
 }
 
 # ============================================================
+#  SECTION 4 - AUTOMATISATION (tache planifiee de desactivation)
+# ============================================================
+
+function Get-DisableByDateScheduledScriptContent {
+    <#
+        Genere le contenu du script autonome deploye sur le serveur cible et
+        execute par la tache planifiee. Les parametres (seuils, exclusions) sont
+        figes au moment de la configuration : pour les changer, relancer la
+        configuration (menu Automatisation > 1), qui remplace le script deploye.
+        Ne depend d'aucune variable/fonction du script menu (execution differee
+        et decouplee), a l'image du script de rotation KRBTGT.
+    #>
+    param(
+        [int]$DaysUsers,
+        [int]$DaysComputers,
+        [bool]$ApplyUsers,
+        [bool]$ApplyComputers,
+        [string[]]$ExcludedOUsUsers,
+        [string[]]$ExcludedOUsComputers,
+        [string[]]$ExcludedGroups,
+        [string]$DisableUserOUName,
+        [string]$DisableComputerOUName
+    )
+
+    $ousUsersLiteral = ($ExcludedOUsUsers | ForEach-Object { "'{0}'" -f ($_ -replace "'", "''") }) -join ', '
+    $ousComputersLiteral = ($ExcludedOUsComputers | ForEach-Object { "'{0}'" -f ($_ -replace "'", "''") }) -join ', '
+    $groupsLiteral = ($ExcludedGroups | ForEach-Object { "'{0}'" -f ($_ -replace "'", "''") }) -join ', '
+
+    $header = @"
+# Parametres generes par le menu Automatisation le $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+`$DaysUsers = $DaysUsers
+`$DaysComputers = $DaysComputers
+`$ApplyUsers = `$$ApplyUsers
+`$ApplyComputers = `$$ApplyComputers
+`$ExcludedOUsUsers = @($ousUsersLiteral)
+`$ExcludedOUsComputers = @($ousComputersLiteral)
+`$ExcludedGroups = @($groupsLiteral)
+`$DisableUserOUName = '$DisableUserOUName'
+`$DisableComputerOUName = '$DisableComputerOUName'
+"@
+
+    $body = @'
+# Disable-ByDate.ps1
+# Deploye et execute automatiquement par la tache planifiee "ADHC - Desactivation Auto (date/anciennete)".
+# Ne PAS executer manuellement sans avoir revu les parametres et exclusions ci-dessus.
+
+$logFile = "C:\ADHC-Scripts\Disable-ByDate.log"
+
+function Write-DisLog {
+    param([string]$Message)
+    $line = "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
+    Add-Content -Path $logFile -Value $line -Encoding UTF8
+    try {
+        if (-not [System.Diagnostics.EventLog]::SourceExists("ADHC-AutoDisable")) {
+            New-EventLog -LogName Application -Source "ADHC-AutoDisable" -ErrorAction SilentlyContinue
+        }
+        Write-EventLog -LogName Application -Source "ADHC-AutoDisable" -EventId 2000 -EntryType Information -Message $Message -ErrorAction SilentlyContinue
+    } catch { }
+}
+
+function Test-UnderExcludedOU {
+    param([string]$DN, [string[]]$OUList)
+    foreach ($ou in $OUList) {
+        if ([string]::IsNullOrWhiteSpace($ou)) { continue }
+        if ($DN -like "*,$ou") { return $true }
+    }
+    return $false
+}
+
+function Add-DisabledMarkerToDescription {
+    param([Parameter(Mandatory)][string]$Identity)
+    $marker = "Desactive le : {0}" -f (Get-Date -Format "dd/MM/yyyy")
+    $obj = Get-ADObject -Identity $Identity -Properties Description
+    $newDescription = if ([string]::IsNullOrWhiteSpace($obj.Description)) { $marker } else { "$($obj.Description) | $marker" }
+    Set-ADObject -Identity $Identity -Replace @{ Description = $newDescription }
+}
+
+Import-Module ActiveDirectory -ErrorAction Stop
+Write-DisLog "Debut de l'execution planifiee (utilisateurs > $DaysUsers j / postes > $DaysComputers j)."
+
+try {
+    $domain = Get-ADDomain -ErrorAction Stop
+} catch {
+    Write-DisLog "Impossible de contacter le domaine. Execution annulee."
+    exit 1
+}
+$domainDN = $domain.DistinguishedName
+$domainSidStr = $domain.DomainSID.Value
+
+# --- Garde-fous non desactivables : comptes/objets systeme toujours proteges ---
+$protectedSids = New-Object System.Collections.Generic.HashSet[string]
+foreach ($rid in 500, 501, 502) {
+    try {
+        $obj = Get-ADObject -LDAPFilter "(objectSid=$domainSidStr-$rid)" -ErrorAction SilentlyContinue
+        if ($obj) { [void]$protectedSids.Add($obj.ObjectSID.Value) }
+    } catch { }
+}
+try {
+    $selfSid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+    [void]$protectedSids.Add($selfSid)
+} catch { }
+
+foreach ($g in $ExcludedGroups) {
+    try {
+        Get-ADGroupMember -Identity $g -Recursive -ErrorAction Stop | ForEach-Object { [void]$protectedSids.Add($_.SID.Value) }
+    } catch {
+        Write-DisLog "Groupe d'exclusion '$g' introuvable ou inaccessible - ignore."
+    }
+}
+
+$protectedComputerDNs = New-Object System.Collections.Generic.HashSet[string]
+try {
+    Get-ADDomainController -Filter * -ErrorAction Stop | ForEach-Object {
+        try { [void]$protectedComputerDNs.Add((Get-ADComputer -Identity $_.Name).DistinguishedName) } catch { }
+    }
+} catch { }
+
+$disableUserOUDN = "OU=$DisableUserOUName,$domainDN"
+$disableComputerOUDN = "OU=$DisableComputerOUName,$domainDN"
+
+if ($ApplyUsers) {
+    try {
+        if (-not (Get-ADOrganizationalUnit -Filter "Name -eq '$DisableUserOUName'" -SearchBase $domainDN -ErrorAction SilentlyContinue)) {
+            New-ADOrganizationalUnit -Name $DisableUserOUName -Path $domainDN -ProtectedFromAccidentalDeletion $true
+        }
+
+        $cutoffUsers = (Get-Date).AddDays(-$DaysUsers)
+        $candidates = @(Get-ADUser -Filter { (Enabled -eq $true) -and (LastLogonTimestamp -lt $cutoffUsers) } -Properties LastLogonTimestamp, SID)
+        $done = 0
+        foreach ($u in $candidates) {
+            if ($protectedSids.Contains($u.SID.Value)) { continue }
+            if (Test-UnderExcludedOU -DN $u.DistinguishedName -OUList $ExcludedOUsUsers) { continue }
+            if ($u.DistinguishedName -like "*,$disableUserOUDN" -or $u.DistinguishedName -like "*,$disableComputerOUDN") { continue }
+            try {
+                Disable-ADAccount -Identity $u.DistinguishedName -ErrorAction Stop
+                Add-DisabledMarkerToDescription -Identity $u.DistinguishedName
+                Move-ADObject -Identity $u.DistinguishedName -TargetPath $disableUserOUDN -ErrorAction Stop
+                $done++
+            } catch {
+                Write-DisLog "Echec sur l'utilisateur $($u.SamAccountName) : $($_.Exception.Message)"
+            }
+        }
+        Write-DisLog "$done utilisateur(s) desactive(s) et deplace(s) vers $disableUserOUDN (sur $($candidates.Count) candidat(s) avant exclusions)."
+    } catch {
+        Write-DisLog "ECHEC du volet UTILISATEURS : $($_.Exception.Message)"
+    }
+}
+
+if ($ApplyComputers) {
+    try {
+        if (-not (Get-ADOrganizationalUnit -Filter "Name -eq '$DisableComputerOUName'" -SearchBase $domainDN -ErrorAction SilentlyContinue)) {
+            New-ADOrganizationalUnit -Name $DisableComputerOUName -Path $domainDN -ProtectedFromAccidentalDeletion $true
+        }
+
+        $cutoffComputers = (Get-Date).AddDays(-$DaysComputers)
+        $candidates = @(Get-ADComputer -Filter { (Enabled -eq $true) -and (LastLogonTimestamp -lt $cutoffComputers) } -Properties LastLogonTimestamp, SID)
+        $done = 0
+        foreach ($c in $candidates) {
+            if ($protectedSids.Contains($c.SID.Value)) { continue }
+            if ($protectedComputerDNs.Contains($c.DistinguishedName)) { continue }
+            if (Test-UnderExcludedOU -DN $c.DistinguishedName -OUList $ExcludedOUsComputers) { continue }
+            if ($c.DistinguishedName -like "*,$disableUserOUDN" -or $c.DistinguishedName -like "*,$disableComputerOUDN") { continue }
+            try {
+                Disable-ADAccount -Identity $c.DistinguishedName -ErrorAction Stop
+                Add-DisabledMarkerToDescription -Identity $c.DistinguishedName
+                Move-ADObject -Identity $c.DistinguishedName -TargetPath $disableComputerOUDN -ErrorAction Stop
+                $done++
+            } catch {
+                Write-DisLog "Echec sur le poste $($c.Name) : $($_.Exception.Message)"
+            }
+        }
+        Write-DisLog "$done poste(s)/serveur(s) desactive(s) et deplace(s) vers $disableComputerOUDN (sur $($candidates.Count) candidat(s) avant exclusions)."
+    } catch {
+        Write-DisLog "ECHEC du volet POSTES/SERVEURS : $($_.Exception.Message)"
+    }
+}
+
+Write-DisLog "Fin de l'execution planifiee."
+'@
+
+    return $header + "`r`n" + $body
+}
+
+function Grant-DisableAutomationPermissions {
+    <#
+        Delegue au principal indique UNIQUEMENT les droits necessaires pour que
+        la tache planifiee desactive et deplace des comptes utilisateur/ordinateur :
+          - Ecriture de la propriete userAccountControl (desactivation)
+          - Creation/suppression d'objets User et Computer (necessaire pour
+            Move-ADObject, qui equivaut a une suppression dans le conteneur source
+            + une creation dans le conteneur cible)
+        Jamais de droit Domain Admin accorde a la tache planifiee. Applique sur la
+        racine de delegation fournie (racine du domaine par defaut, ou une UO
+        reduite si choisie) : reduire cette racine limite d'autant le perimetre
+        reellement delegue.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$PrincipalSam,
+        [Parameter(Mandatory)][string]$TargetDC,
+        [Parameter(Mandatory)][string]$DelegationRootDN
+    )
+
+    $domainNetbios = (Get-ADDomain).NetBIOSName
+
+    Invoke-Guarded -Description ("Delegation (userAccountControl + creation/suppression User/Computer) sur {0} a {1}" -f $DelegationRootDN, $PrincipalSam) -Action {
+        Invoke-Command -ComputerName $TargetDC -ScriptBlock {
+            param($rootDN, $account)
+            & dsacls.exe "$rootDN" /I:S /G "${account}:WP;userAccountControl;user" | Out-Null
+            & dsacls.exe "$rootDN" /I:S /G "${account}:WP;userAccountControl;computer" | Out-Null
+            & dsacls.exe "$rootDN" /I:S /G "${account}:CCDC;user" | Out-Null
+            & dsacls.exe "$rootDN" /I:S /G "${account}:CCDC;computer" | Out-Null
+        } -ArgumentList $DelegationRootDN, "$domainNetbios\$PrincipalSam" -ErrorAction Stop
+    }
+}
+
+function Invoke-AutomationSetupScheduledTask {
+    Write-Host "`n--- Configuration de la tache planifiee de desactivation automatique ---" -ForegroundColor Red
+    Write-Host "Execute PERIODIQUEMENT, sans intervention, la desactivation des comptes" -ForegroundColor DarkGray
+    Write-Host "utilisateurs/ordinateurs inactifs, avec les memes garde-fous que l'action manuelle :" -ForegroundColor DarkGray
+    Write-Host "UO exclues, groupes exclus, comptes systeme (krbtgt, Administrateur, Invite, DC," -ForegroundColor DarkGray
+    Write-Host "compte d'execution lui-meme) toujours proteges." -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "Important : pour une execution automatique et recurrente, le seuil se base sur une" -ForegroundColor Yellow
+    Write-Host "ANCIENNETE glissante (X jours sans connexion), recalculee a chaque execution - une" -ForegroundColor Yellow
+    Write-Host "date fixe n'aurait plus de sens d'une execution a l'autre." -ForegroundColor Yellow
+
+    $applyUsers = (Read-Host "Desactiver automatiquement les UTILISATEURS inactifs ? (O/N)") -match '^[oOyY]'
+    $applyComputers = (Read-Host "Desactiver automatiquement les POSTES/SERVEURS inactifs ? (O/N)") -match '^[oOyY]'
+    if (-not $applyUsers -and -not $applyComputers) { Write-Log "Aucun perimetre selectionne, configuration annulee." -Level WARN; return }
+
+    $thresholds = Read-InactivityThresholds -DefaultUserDays 180 -DefaultComputerDays 90
+
+    $excludedOUsUsers = @()
+    $excludedOUsComputers = @()
+    if ($applyUsers) { $excludedOUsUsers = @(Select-ExclusionOUs -Label "les UTILISATEURS") }
+    if ($applyComputers) { $excludedOUsComputers = @(Select-ExclusionOUs -Label "les POSTES/SERVEURS") }
+    $excludedGroups = @(Read-ExtraExclusionGroups)
+
+    $daysInterval = Read-Host "Intervalle entre chaque execution automatique, en jours [defaut 7]"
+    if ([string]::IsNullOrWhiteSpace($daysInterval) -or $daysInterval -notmatch '^\d+$') { $daysInterval = 7 }
+    $daysInterval = [int]$daysInterval
+    if ($daysInterval -lt 1) { $daysInterval = 1 }
+
+    $dcs = Get-DomainControllersList
+    if (-not $dcs) { return }
+    Write-Host "Controleurs de domaine disponibles :"
+    for ($i = 0; $i -lt $dcs.Count; $i++) { Write-Host ("  [{0}] {1}" -f $i, $dcs[$i].HostName) }
+    $pdc = (Get-ADDomain).PDCEmulator
+    $defaultIdx = [array]::IndexOf($dcs.HostName, $pdc)
+    if ($defaultIdx -lt 0) { $defaultIdx = 0 }
+    $idxInput = Read-Host ("DC qui hebergera la tache planifiee [defaut {0} = {1}]" -f $defaultIdx, $dcs[$defaultIdx].HostName)
+    $targetDC = if ($idxInput -match '^\d+$' -and [int]$idxInput -lt $dcs.Count) { $dcs[[int]$idxInput].HostName } else { $dcs[$defaultIdx].HostName }
+
+    $gmsaName = Read-Host "Nom du gMSA dedie a creer/reutiliser [defaut svc-ADAutoDisable]"
+    if ([string]::IsNullOrWhiteSpace($gmsaName)) { $gmsaName = "svc-ADAutoDisable" }
+
+    $domain = Get-ADDomain
+    $domainDN = $domain.DistinguishedName
+    $domainDNS = $domain.DNSRoot
+    $domainNetbios = $domain.NetBIOSName
+
+    Write-Host ""
+    Write-Host "Perimetre de delegation (droits accordes au gMSA) :" -ForegroundColor Yellow
+    Write-Host ("  Par defaut : racine du domaine ({0}), avec heritage - necessaire car les postes" -f $domainDN) -ForegroundColor DarkGray
+    Write-Host "  et utilisateurs concernes peuvent se trouver n'importe ou hors des UO exclues." -ForegroundColor DarkGray
+    $delegationRoot = Read-Host "Restreindre la delegation a une UO precise (DN complet, vide = racine du domaine)"
+    if ([string]::IsNullOrWhiteSpace($delegationRoot)) { $delegationRoot = $domainDN }
+
+    Write-Host ""
+    Write-Host "Resume :" -ForegroundColor Yellow
+    Write-Host ("  Utilisateurs      : {0}{1}" -f $(if ($applyUsers) { "OUI, > $($thresholds.UserDays) j" } else { "non" }), $(if ($applyUsers -and $excludedOUsUsers.Count -gt 0) { " ($($excludedOUsUsers.Count) UO exclue(s))" } else { "" }))
+    Write-Host ("  Postes/Serveurs   : {0}{1}" -f $(if ($applyComputers) { "OUI, > $($thresholds.ComputerDays) j" } else { "non" }), $(if ($applyComputers -and $excludedOUsComputers.Count -gt 0) { " ($($excludedOUsComputers.Count) UO exclue(s))" } else { "" }))
+    Write-Host ("  Groupes exclus    : {0}" -f ($excludedGroups -join ', '))
+    Write-Host ("  Intervalle        : tous les {0} jour(s)" -f $daysInterval)
+    Write-Host ("  Hote              : {0}" -f $targetDC)
+    Write-Host ("  Compte de service : gMSA {0}" -f $gmsaName)
+    Write-Host ("  Racine delegation : {0}" -f $delegationRoot)
+
+    if (-not (Confirm-Action "Creer le gMSA, deleguer les droits, deployer le script et creer la tache planifiee avec ces parametres" -Strong)) { return }
+
+    if (-not (Get-OrEnsureKdsRootKey)) { return }
+
+    Invoke-Guarded -Description ("Creation du gMSA {0}" -f $gmsaName) -Action {
+        $existingGmsa = Get-ADServiceAccount -Filter "Name -eq '$gmsaName'" -ErrorAction SilentlyContinue
+        if (-not $existingGmsa) {
+            $dcComputer = Get-ADComputer -Identity $targetDC.Split('.')[0]
+            New-ADServiceAccount -Name $gmsaName -DNSHostName "$gmsaName.$domainDNS" -PrincipalsAllowedToRetrieveManagedPassword $dcComputer.DistinguishedName -Enabled $true
+        } else {
+            Write-Log "Le gMSA existe deja, reutilisation." -Level INFO
+        }
+    }
+
+    Invoke-Guarded -Description ("Installation/test du gMSA {0} sur {1}" -f $gmsaName, $targetDC) -Action {
+        Invoke-Command -ComputerName $targetDC -ScriptBlock {
+            param($name)
+            Import-Module ActiveDirectory -ErrorAction SilentlyContinue
+            Install-ADServiceAccount -Identity $name -ErrorAction Stop
+            if (-not (Test-ADServiceAccount -Identity $name)) {
+                throw "Le test du gMSA a echoue (Test-ADServiceAccount)."
+            }
+        } -ArgumentList $gmsaName -ErrorAction Stop
+    }
+
+    Grant-DisableAutomationPermissions -PrincipalSam "$gmsaName$" -TargetDC $targetDC -DelegationRootDN $delegationRoot
+
+    Invoke-Guarded -Description "Deploiement du script de desactivation automatique sur le DC cible" -Action {
+        $scriptContent = Get-DisableByDateScheduledScriptContent -DaysUsers $thresholds.UserDays -DaysComputers $thresholds.ComputerDays `
+            -ApplyUsers $applyUsers -ApplyComputers $applyComputers `
+            -ExcludedOUsUsers $excludedOUsUsers -ExcludedOUsComputers $excludedOUsComputers -ExcludedGroups $excludedGroups `
+            -DisableUserOUName $Script:DisableUserOUName -DisableComputerOUName $Script:DisableComputerOUName
+        Invoke-Command -ComputerName $targetDC -ScriptBlock {
+            param($content)
+            $dir = "C:\ADHC-Scripts"
+            if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+            Set-Content -Path (Join-Path $dir "Disable-ByDate.ps1") -Value $content -Encoding UTF8
+        } -ArgumentList $scriptContent -ErrorAction Stop
+    }
+
+    Invoke-Guarded -Description ("Creation de la tache planifiee (tous les {0} jours) sur {1}" -f $daysInterval, $targetDC) -Action {
+        Invoke-Command -ComputerName $targetDC -ScriptBlock {
+            param($gmsaSam, $domainNetbios, $intervalDays)
+            $taskName = "ADHC - Desactivation Auto (date/anciennete)"
+            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument '-NoProfile -ExecutionPolicy Bypass -File "C:\ADHC-Scripts\Disable-ByDate.ps1"'
+            $trigger = New-ScheduledTaskTrigger -Daily -DaysInterval $intervalDays -At "03:00"
+            $principal = New-ScheduledTaskPrincipal -UserId "$domainNetbios\$gmsaSam`$" -LogonType Password -RunLevel Highest
+            $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd
+
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+            Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description "Desactivation automatique des comptes utilisateurs/ordinateurs inactifs - deploye par le script de remediation AD"
+        } -ArgumentList $gmsaName, $domainNetbios, $daysInterval -ErrorAction Stop
+    }
+
+    Write-Log ("Tache planifiee 'ADHC - Desactivation Auto (date/anciennete)' creee sur {0}, execution tous les {1} jours a 03:00, sous le compte {2}\{3}$." -f $targetDC, $daysInterval, $domainNetbios, $gmsaName) -Level OK
+    Write-Log "Journal local sur le DC : C:\ADHC-Scripts\Disable-ByDate.log (+ journal d'evenements Application, source ADHC-AutoDisable)." -Level INFO
+    Write-Log "Pour changer les seuils/exclusions, relancez cette configuration : elle regenere et remplace le script deploye et la tache." -Level INFO
+}
+
+function Invoke-AutomationShowStatus {
+    Write-Host "`n--- Etat de la tache planifiee de desactivation automatique ---" -ForegroundColor Magenta
+    $dcs = Get-DomainControllersList
+    if (-not $dcs) { return }
+    $taskName = "ADHC - Desactivation Auto (date/anciennete)"
+    foreach ($dc in $dcs) {
+        try {
+            $task = Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+                param($name)
+                Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue | Get-ScheduledTaskInfo -ErrorAction SilentlyContinue
+            } -ArgumentList $taskName -ErrorAction Stop
+            if ($task) {
+                Write-Host ("{0} : tache presente - derniere execution {1}, prochaine {2}, dernier resultat {3}" -f $dc.HostName, $task.LastRunTime, $task.NextRunTime, $task.LastTaskResult) -ForegroundColor Yellow
+            } else {
+                Write-Host ("{0} : aucune tache trouvee" -f $dc.HostName) -ForegroundColor DarkGray
+            }
+        } catch {
+            Write-Log ("Impossible d'interroger {0} : {1}" -f $dc.HostName, $_.Exception.Message) -Level WARN
+        }
+    }
+}
+
+function Invoke-AutomationRemoveScheduledTask {
+    Write-Host "`n--- Suppression de la tache planifiee de desactivation automatique ---" -ForegroundColor Red
+    Write-Host "Ceci arrete uniquement l'AUTOMATISATION : les comptes deja desactives/deplaces ne sont pas restaures." -ForegroundColor DarkGray
+
+    $dcs = Get-DomainControllersList
+    if (-not $dcs) { return }
+    Write-Host "Controleurs de domaine disponibles :"
+    for ($i = 0; $i -lt $dcs.Count; $i++) { Write-Host ("  [{0}] {1}" -f $i, $dcs[$i].HostName) }
+    $idxInput = Read-Host "DC hebergeant la tache a supprimer (numero)"
+    if ($idxInput -notmatch '^\d+$' -or [int]$idxInput -ge $dcs.Count) { Write-Log "Selection invalide." -Level WARN; return }
+    $targetDC = $dcs[[int]$idxInput].HostName
+
+    if (-not (Confirm-Action ("Supprimer la tache planifiee de desactivation automatique sur {0}" -f $targetDC) -Strong)) { return }
+
+    Invoke-Guarded -Description ("Suppression de la tache planifiee sur {0}" -f $targetDC) -Action {
+        Invoke-Command -ComputerName $targetDC -ScriptBlock {
+            Unregister-ScheduledTask -TaskName "ADHC - Desactivation Auto (date/anciennete)" -Confirm:$false -ErrorAction Stop
+        } -ErrorAction Stop
+    }
+}
+
+# ============================================================
 #  MENUS
 # ============================================================
 
@@ -1239,20 +2060,22 @@ function Show-SafeMenu {
         Write-Host " 6. Activer la journalisation PowerShell (Script Block Logging) via GPO"
         Write-Host " 7. Retirer le flag 'Mot de passe non requis' sur les comptes concernes"
         Write-Host " 8. Activer l'audit NTLM (detection NTLMv1/LM avant blocage)"
-        Write-Host " 9. Executer TOUTES les actions SAFE"
+        Write-Host " 9. Activer PowerShell Remoting (WinRM) sur les DC injoignables (GPO et/ou immediat via WMI)"
+        Write-Host " 10. Executer TOUTES les actions SAFE"
         Write-Host " 0. Retour au menu principal"
         Write-Host ""
         $choice = Read-Host "Votre choix"
         switch ($choice) {
-            "1" { Invoke-SafeEnableRecycleBin; Pause-Menu }
-            "2" { Invoke-SafeDisableGuest; Pause-Menu }
-            "3" { Invoke-SafeProtectOUs; Pause-Menu }
-            "4" { Invoke-SafeSetMachineAccountQuotaZero; Pause-Menu }
-            "5" { Invoke-SafeEnableDCAuditPolicy; Pause-Menu }
-            "6" { Invoke-SafeEnablePowerShellLogging; Pause-Menu }
-            "7" { Invoke-SafeClearPasswordNotRequired; Pause-Menu }
-            "8" { Invoke-SafeEnableNtlmAudit; Pause-Menu }
-            "9" { Invoke-SafeAll; Pause-Menu }
+            "1"  { Invoke-SafeEnableRecycleBin; Pause-Menu }
+            "2"  { Invoke-SafeDisableGuest; Pause-Menu }
+            "3"  { Invoke-SafeProtectOUs; Pause-Menu }
+            "4"  { Invoke-SafeSetMachineAccountQuotaZero; Pause-Menu }
+            "5"  { Invoke-SafeEnableDCAuditPolicy; Pause-Menu }
+            "6"  { Invoke-SafeEnablePowerShellLogging; Pause-Menu }
+            "7"  { Invoke-SafeClearPasswordNotRequired; Pause-Menu }
+            "8"  { Invoke-SafeEnableNtlmAudit; Pause-Menu }
+            "9"  { Invoke-SafeEnableWinRmOnDCs; Pause-Menu }
+            "10" { Invoke-SafeAll; Pause-Menu }
             "0" { return }
             default { }
         }
@@ -1276,6 +2099,7 @@ function Show-RiskyMenu {
         Write-Host " 11. Desactiver les comptes utilisateurs/ordinateurs inactifs (quarantaine)"
         Write-Host " 12. Forcer l'expiration des mots de passe des comptes a privileges"
         Write-Host " 13. Configurer la rotation KRBTGT automatique planifiee (gMSA dedie + tache planifiee)"
+        Write-Host " 14. Desactiver postes/serveurs ET/OU utilisateurs a partir d'une DATE choisie (UO dediees + garde-fous)"
         Write-Host " 0.  Retour au menu principal"
         Write-Host ""
         $choice = Read-Host "Votre choix"
@@ -1293,6 +2117,7 @@ function Show-RiskyMenu {
             "11" { Invoke-RiskyDisableInactiveAccounts; Pause-Menu }
             "12" { Invoke-RiskyForcePasswordExpirationPrivileged; Pause-Menu }
             "13" { Invoke-RiskySetupKrbtgtScheduledRotation; Pause-Menu }
+            "14" { Invoke-RiskyDisableByDate; Pause-Menu }
             "0"  { return }
             default { }
         }
@@ -1325,6 +2150,26 @@ function Show-ReportMenu {
     } while ($true)
 }
 
+function Show-AutomationMenu {
+    do {
+        Show-Banner
+        Write-Host "=== [4] AUTOMATISATION - taches planifiees ===" -ForegroundColor Red
+        Write-Host " 1. Configurer la tache planifiee de desactivation automatique (postes/utilisateurs)"
+        Write-Host " 2. Afficher l'etat de la tache planifiee existante"
+        Write-Host " 3. Supprimer la tache planifiee"
+        Write-Host " 0. Retour au menu principal"
+        Write-Host ""
+        $choice = Read-Host "Votre choix"
+        switch ($choice) {
+            "1" { Invoke-AutomationSetupScheduledTask; Pause-Menu }
+            "2" { Invoke-AutomationShowStatus; Pause-Menu }
+            "3" { Invoke-AutomationRemoveScheduledTask; Pause-Menu }
+            "0" { return }
+            default { }
+        }
+    } while ($true)
+}
+
 function Show-MainMenu {
     do {
         Show-Banner
@@ -1332,6 +2177,7 @@ function Show-MainMenu {
         Write-Host " [1] Actions SAFE (aucune incidence prod)" -ForegroundColor Green
         Write-Host " [2] Actions A VALIDER (impact potentiel)" -ForegroundColor Red
         Write-Host " [3] Rapports (lecture seule)" -ForegroundColor Magenta
+        Write-Host " [4] Automatisation (taches planifiees)" -ForegroundColor Red
         Write-Host ""
         $modeLabel = if ($Script:SimulationMode) { "Activer le mode REEL (desactiver la simulation)" } else { "Repasser en mode SIMULATION" }
         Write-Host (" [S] {0}" -f $modeLabel) -ForegroundColor Yellow
@@ -1342,6 +2188,7 @@ function Show-MainMenu {
             "1" { Show-SafeMenu }
             "2" { Show-RiskyMenu }
             "3" { Show-ReportMenu }
+            "4" { Show-AutomationMenu }
             "S" {
                 if ($Script:SimulationMode) {
                     Write-Host ""

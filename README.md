@@ -14,8 +14,12 @@ Le script est volontairement construit pour qu'aucune action ne puisse partir "p
 - [Menu \[1\] Actions SAFE](#menu-1--actions-safe)
 - [Menu \[2\] Actions À VALIDER](#menu-2--actions-à-valider)
 - [Menu \[3\] Rapports](#menu-3--rapports)
+- [Menu \[4\] Automatisation](#menu-4--automatisation)
+- [Focus : désactivation par date choisie (garde-fous et UO dédiées)](#focus--désactivation-par-date-choisie-garde-fous-et-uo-dédiées)
 - [Focus : rotation automatique du mot de passe KRBTGT](#focus--rotation-automatique-du-mot-de-passe-krbtgt)
 - [Focus : audit NTLM avant blocage NTLMv1/LM](#focus--audit-ntlm-avant-blocage-ntlmv1lm)
+- [Focus : activer WinRM sur les DC quand ils sont injoignables](#focus--activer-winrm-sur-les-dc-quand-ils-sont-injoignables)
+- [Dépannage : erreur WinRM](#dépannage--erreur-winrm-la-connexion-au-serveur-distant--a-échoué)
 - [Journalisation](#journalisation)
 - [Limites connues / points d'attention](#limites-connues--points-dattention)
 
@@ -45,6 +49,7 @@ MENU PRINCIPAL
  [1] Actions SAFE (aucune incidence prod)
  [2] Actions A VALIDER (impact potentiel)
  [3] Rapports (lecture seule)
+ [4] Automatisation (taches planifiees)
 
  [S] Activer le mode REEL (desactiver la simulation)
  [Q] Quitter
@@ -58,7 +63,7 @@ MENU PRINCIPAL
   - Actions À VALIDER → il faut taper le mot exact `CONFIRMER` (sensible à la casse), après lecture d'un avertissement dédié.
 - **Journal complet** de toute la session dans `Logs\Remediation_AD_<date>.log`, plus des exports CSV horodatés pour chaque rapport/liste de comptes concernés.
 - **Vérifications préalables avant action** quand c'est pertinent : ex. détection des imprimantes avant d'arrêter le service Spooler, rappel de consulter le rapport NTLMv1 avant de désactiver NTLMv1.
-- **Aucune action irréversible cachée** : les comptes/ordinateurs "inactifs" ne sont jamais supprimés, seulement désactivés et déplacés dans une OU de quarantaine dédiée (`OU_QUARANTAINE_COMPTES_INACTIFS`).
+- **Aucune action irréversible cachée** : les comptes/ordinateurs "inactifs" ne sont jamais supprimés, seulement désactivés et déplacés dans une OU de quarantaine dédiée (`OU_QUARANTAINE_COMPTES_INACTIFS` pour l'action par ancienneté ; `disable_user` / `disable_computer` pour l'action par date choisie et l'automatisation — voir [focus dédié](#focus--désactivation-par-date-choisie-garde-fous-et-uo-dédiées)).
 - Les GUID de sous-catégories d'audit (`auditpol`) et les champs d'événements Windows utilisés sont **indépendants de la langue de l'OS** (important sur un DC installé en français, où les noms anglais font échouer les commandes natives).
 
 ## Menu [1] : Actions SAFE
@@ -75,7 +80,8 @@ Aucune de ces actions ne modifie un comportement fonctionnel existant : elles ac
 | 6 | Activer la journalisation PowerShell (Script Block Logging) | GPO liée à l'OU Domain Controllers. |
 | 7 | Retirer le flag "Mot de passe non requis" | Ne force pas de changement immédiat, retire juste l'exemption pour le prochain changement. |
 | 8 | Activer l'audit NTLM | Journalisation uniquement (jamais de blocage) pour détecter qui utilise encore NTLMv1/LM — voir [focus dédié](#focus--audit-ntlm-avant-blocage-ntlmv1lm). |
-| 9 | Exécuter TOUTES les actions SAFE | Enchaîne les actions 1 à 8 avec confirmation globale. |
+| 9 | Activer PowerShell Remoting (WinRM) sur les DC injoignables | Détecte les DC injoignables puis propose une GPO (fonctionne même si WinRM est totalement arrêté, prise en compte différée) et/ou une activation immédiate via WMI/DCOM — voir [focus dédié](#focus--activer-winrm-sur-les-dc-quand-ils-sont-injoignables). |
+| 10 | Exécuter TOUTES les actions SAFE | Enchaîne les actions 1 à 9 (WinRM en premier) avec confirmation globale. |
 
 ## Menu [2] : Actions À VALIDER
 
@@ -99,6 +105,7 @@ Ces actions peuvent casser l'authentification de matériels/applications legacy 
 | 11 | Désactiver les comptes inactifs | **Seuils de jours demandés à chaque exécution** (pas de valeur figée). Déplace en quarantaine + désactive, ne supprime jamais. |
 | 12 | Forcer l'expiration des mots de passe admin | Prévenir les propriétaires des comptes concernés avant expiration effective. |
 | 13 | Configurer la rotation KRBTGT planifiée | Voir [focus dédié](#focus--rotation-automatique-du-mot-de-passe-krbtgt). |
+| 14 | Désactiver postes/serveurs ET/OU utilisateurs à partir d'une **date choisie** | Déplace vers des UO dédiées `disable_user` / `disable_computer` + désactive. Garde-fous OU/groupes — voir [focus dédié](#focus--désactivation-par-date-choisie-garde-fous-et-uo-dédiées). |
 
 ## Menu [3] : Rapports
 
@@ -112,6 +119,47 @@ Lecture seule, aucune modification. Chaque rapport s'exporte en CSV horodaté da
 | 4 | Hotfix installés sur les DC | |
 | 5 | NTLMv1/LM détecté | Nécessite l'audit NTLM (menu SAFE 8) actif depuis un moment ; peut être **long** à exécuter (lecture du journal Sécurité). |
 | 6 | Export global | Regroupe les rapports 1 à 4 (le rapport NTLMv1/LM en est exclu volontairement, car trop coûteux pour un export "tout en un"). |
+
+## Menu [4] : Automatisation
+
+Permet de faire tourner la désactivation par ancienneté **sans intervention humaine**, tout en gardant les mêmes garde-fous que l'action manuelle.
+
+| # | Action | Remarque |
+|---|--------|----------|
+| 1 | Configurer la tâche planifiée de désactivation automatique | Reprend les mêmes questions que l'action manuelle (périmètre users/postes, seuils, UO exclues, groupes exclus), plus l'intervalle entre exécutions et le DC hôte. Crée un gMSA dédié, délègue les droits minimaux nécessaires, déploie le script et crée la tâche planifiée. |
+| 2 | Afficher l'état de la tâche planifiée existante | Interroge chaque DC : présence de la tâche, dernière/prochaine exécution, dernier résultat. |
+| 3 | Supprimer la tâche planifiée | Arrête uniquement l'automatisation ; les comptes déjà désactivés/déplacés ne sont pas restaurés. |
+
+## Focus : désactivation par date choisie (garde-fous et UO dédiées)
+
+L'action `[2] > 14` désactive les comptes utilisateurs et/ou postes/serveurs **inactifs depuis une date précise que vous choisissez** (au lieu d'un seuil en jours glissant comme l'action `[2] > 11`). Les comptes concernés sont **déplacés dans une UO dédiée et créée automatiquement si absente** (jamais supprimés) :
+- `disable_user` pour les comptes utilisateurs,
+- `disable_computer` pour les postes/serveurs.
+
+**Garde-fous toujours actifs, non désactivables :**
+- `krbtgt`, le compte `Administrateur` et le compte `Invité` intégrés (identifiés par leur RID bien connu 500/501/502, donc indépendants du nom si renommés),
+- tous les objets ordinateur des **contrôleurs de domaine**,
+- le **compte qui exécute le script** (jamais de risque de se désactiver soi-même),
+- tout compte déjà présent dans les UO `disable_user` / `disable_computer` (pas de retraitement).
+
+**Garde-fous configurables à chaque exécution :**
+- **UO à exclure** (une liste séparée pour les utilisateurs et pour les postes/serveurs) : par exemple les UO de comptes de service, de serveurs applicatifs critiques, de postes VIP.
+- **Groupes à exclure** : une liste de groupes à privilèges est exclue **par défaut** (Domain Admins, Enterprise Admins, Schema Admins, Administrators, Account/Backup/Server Operators, Print Operators, Group Policy Creator Owners, Protected Users, DnsAdmins, Cert Publishers), et des groupes supplémentaires (comptes de service, VIP...) peuvent être ajoutés à la volée.
+
+Avant toute désactivation, un export CSV horodaté (`Logs\Desactivation_ParDate_*.csv`) liste **à la fois** les comptes qui seront traités **et** ceux exclus par un garde-fou (avec la raison), pour permettre une revue complète avant confirmation (`CONFIRMER`).
+
+À chaque désactivation (action `[2] > 11` ou `[2] > 14`, manuelle ou automatisée), le script ajoute la mention `Desactive le : jj/mm/aaaa` dans l'attribut **Description** de l'objet AD (sans écraser une description existante, ajoutée à la suite avec un séparateur `|`), pour tracer directement dans l'annuaire quand chaque compte a été désactivé.
+
+À la fin de l'action, le script propose de basculer directement vers la configuration de l'automatisation (menu `[4] > 1`) pour répéter cette désactivation à intervalle régulier.
+
+### Automatisation : architecture
+
+L'action `[4] > 1` déploie, comme pour la rotation KRBTGT, un **script autonome** sur un contrôleur de domaine choisi, exécuté par une tâche planifiée récurrente :
+- Un **gMSA dédié** (nom par défaut `svc-ADAutoDisable`) exécute la tâche — pas de mot de passe à gérer.
+- **Délégation minimale** via `dsacls`, limitée à la racine de délégation choisie (racine du domaine par défaut, ou une UO précise) : uniquement l'écriture de la propriété `userAccountControl` (désactivation) et la création/suppression d'objets `User`/`Computer` (nécessaire pour un déplacement `Move-ADObject`) — jamais de droit Domain Admin accordé à la tâche.
+- Pour une exécution récurrente, le seuil se base sur une **ancienneté glissante** (X jours sans connexion, recalculée à chaque exécution) plutôt qu'une date fixe, qui n'aurait plus de sens d'une exécution à l'autre.
+- Les seuils et exclusions choisis sont figés dans le script déployé ; relancer `[4] > 1` régénère et remplace le script et la tâche avec de nouveaux paramètres.
+- Journalisation locale (`C:\ADHC-Scripts\Disable-ByDate.log`) + Event Log applicatif dédié (`ADHC-AutoDisable`), sur le DC hébergeant la tâche.
 
 ## Focus : rotation automatique du mot de passe KRBTGT
 
@@ -138,8 +186,38 @@ L'action de désactivation NTLMv1 (`[2] > 2`) rappelle explicitement cette étap
 
 - `Logs\Remediation_AD_<horodatage>.log` : trace complète de la session (toutes les actions, y compris en simulation).
 - `Logs\Rapport_*.csv` : un export par rapport exécuté (comptes inactifs, mots de passe n'expirant jamais, groupes privilégiés, hotfix, NTLMv1/LM, délégations Kerberos).
+- `Logs\Comptes_Inactifs_*.csv` / `Logs\Desactivation_ParDate_*.csv` : liste des comptes traités (et exclus par garde-fou, avec la raison) avant chaque désactivation par ancienneté / par date choisie.
 - `Logs\krbtgt_reset_tracking.log` : horodatage du dernier reset manuel krbtgt, pour planifier le second.
 - Sur le DC hébergeant la rotation KRBTGT planifiée : `C:\ADHC-Scripts\Krbtgt-Rotation.log` + journal d'événements `ADHC-KrbtgtRotation`.
+- Sur le DC hébergeant l'automatisation de désactivation : `C:\ADHC-Scripts\Disable-ByDate.log` + journal d'événements `ADHC-AutoDisable`.
+
+## Focus : activer WinRM sur les DC quand ils sont injoignables
+
+L'action `[1] > 9` permet d'activer PowerShell Remoting directement depuis le script, sans avoir à se connecter manuellement à chaque DC. Deux méthodes, proposées ensemble ou séparément :
+
+- **[1] Via GPO (recommandée)** : crée/lie une GPO `ADHC - Activation WinRM sur les DC` sur l'OU Domain Controllers. Cette méthode fonctionne **même si WinRM est totalement arrêté** sur la cible, car une GPO est récupérée par le client via SYSVOL/LDAP — elle ne dépend donc pas du remoting lui-même (contrairement à `Invoke-Command`). Elle configure :
+  - le démarrage automatique du service WinRM (Préférences de stratégie de groupe, registre `HKLM\SYSTEM\CurrentControlSet\Services\WinRM\Start = 2`) ;
+  - la stratégie *"Allow remote server management through WinRM"* (`HKLM\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service`), qui crée automatiquement le listener HTTP sur toutes les IP au démarrage du service (équivalent de `winrm quickconfig`, sans avoir à l'exécuter sur le DC) ;
+  - une règle de pare-feu entrante pour le port 5985 (`Windows Remote Management (HTTP-In)`), poussée directement dans la GPO via le module `NetSecurity` (`Open-NetGPO` / `New-NetFirewallRule -GPOSession` / `Save-NetGPO`) — si ce module est indisponible ou les droits insuffisants, le script avertit et indique comment l'activer manuellement dans la GPO.
+
+  **Prise en compte différée** : au prochain rafraîchissement de GPO sur chaque DC (`gpupdate /force` ou cycle normal), puis un **redémarrage du service WinRM** (ou du serveur) est nécessaire pour que le nouveau listener soit effectivement créé.
+
+- **[2] Immédiate via WMI/DCOM** : pour ne pas attendre un cycle de GPO, active WinRM tout de suite sur les DC choisis en lançant `winrm quickconfig -quiet -force` et l'activation de la règle de pare-feu à distance via WMI/DCOM (`New-CimSession -SessionOption (New-CimSessionOption -Protocol Dcom)` + `Invoke-CimMethod ... Win32_Process Create`). Cette méthode fonctionne dès lors que **WMI/DCOM (RPC)** est lui-même joignable vers le DC — souvent le cas même quand WinRM ne l'est pas, car les règles de pare-feu AD par défaut autorisent WMI entre postes d'administration et DC. Le script revérifie la connectivité WinRM juste après la tentative.
+
+Choisir `[3]` applique les deux méthodes : l'activation immédiate pour un accès tout de suite, et la GPO pour que la configuration survive à un redémarrage/une réinstallation et couvre aussi les futurs DC ajoutés à l'OU.
+
+## Dépannage : erreur WinRM ("La connexion au serveur distant ... a échoué")
+
+Les actions qui s'exécutent sur les contrôleurs de domaine (`auditpol`, audit NTLM, signature LDAP, Spooler, rotation KRBTGT, automatisation...) passent par `Invoke-Command`, qui nécessite le **PowerShell Remoting (WinRM)** activé sur la cible. Avant de lancer ces actions, le script vérifie désormais la joignabilité WinRM de chaque DC (`Test-WSMan`) et **écarte proprement** les DC injoignables plutôt que d'échouer au milieu de l'action, avec un message rappelant les points à vérifier sur le(s) serveur(s) concerné(s).
+
+**Le script peut désormais corriger cela lui-même** via l'action `[1] > 9` (voir [focus dédié](#focus--activer-winrm-sur-les-dc-quand-ils-sont-injoignables)), qui active WinRM par GPO et/ou immédiatement via WMI/DCOM. En dépannage manuel, les points à vérifier sont les mêmes :
+
+- Le service **WinRM** est démarré (`winrm quickconfig` ou `Enable-PSRemoting -Force` sur le serveur cible).
+- La règle de pare-feu **"Gestion à distance de Windows (HTTP-In)"** est activée pour le profil réseau utilisé (Domaine/Privé) — le profil **Public** la bloque par défaut, cas fréquent si l'interface réseau du DC est mal catégorisée.
+- Le **nom du DC se résout correctement en DNS** depuis le poste qui lance le script.
+- Le serveur est bien **allumé et joignable sur le réseau** (pas de règle de pare-feu réseau bloquant le port 5985/5986 entre le poste et le DC).
+
+> Avant cette vérification préalable, une erreur de connexion sur un DC pouvait passer inaperçue : `Invoke-Command` sans `-ErrorAction Stop` traite un échec de connexion comme une erreur non bloquante, affichée en rouge mais n'interrompant pas le script — qui loggait alors à tort "Terminé (OK)" sans que l'action ait réellement été appliquée sur ce DC. Toutes les commandes distantes du script utilisent maintenant `-ErrorAction Stop`, pour que ce type d'échec soit remonté correctement (log `ERROR`) au lieu d'être silencieusement ignoré.
 
 ## Limites connues / points d'attention
 
