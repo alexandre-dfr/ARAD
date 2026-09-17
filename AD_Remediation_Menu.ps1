@@ -32,9 +32,9 @@ param()
 $Script:SimulationMode = $true
 $Script:LogDir  = Join-Path -Path $PSScriptRoot -ChildPath "Logs"
 $Script:LogFile = Join-Path -Path $Script:LogDir -ChildPath ("Remediation_AD_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
-$Script:QuarantineOUName = "OU_QUARANTAINE_COMPTES_INACTIFS"
-$Script:DisableUserOUName = "disable_user"
-$Script:DisableComputerOUName = "disable_computer"
+$Script:QuarantineOUName = "SEC-OU_QUARANTAINE_COMPTES_INACTIFS"
+$Script:DisableUserOUName = "SEC-disable_user"
+$Script:DisableComputerOUName = "SEC-disable_computer"
 # Groupes a privileges exclus PAR DEFAUT (jamais desactives/deplaces) des actions de
 # desactivation par date/anciennete. Des groupes supplementaires (comptes de service,
 # VIP...) peuvent etre ajoutes de maniere interactive au moment de l'action.
@@ -675,7 +675,7 @@ function Invoke-SafeEnablePowerShellLogging {
     }
     Import-Module GroupPolicy -ErrorAction SilentlyContinue
 
-    $gpoName = "ADHC - Audit PowerShell Logging"
+    $gpoName = "SEC - Audit PowerShell Logging"
     $ouTarget = ((Get-ADDomain).DistinguishedName)
     $ouDCs = "OU=Domain Controllers,$ouTarget"
 
@@ -850,7 +850,7 @@ function Invoke-SafeEnableWinRmViaGPO {
     }
     Import-Module GroupPolicy -ErrorAction SilentlyContinue
 
-    $gpoName = "ADHC - Activation WinRM sur les DC"
+    $gpoName = "SEC - Activation WinRM sur les DC"
     $ouDCs = "OU=Domain Controllers,$((Get-ADDomain).DistinguishedName)"
 
     if (-not (Confirm-Action ("Creer/lier la GPO '{0}' sur l'OU Domain Controllers (service WinRM + listener + regle de pare-feu)" -f $gpoName))) { return }
@@ -1058,7 +1058,7 @@ function Get-KrbtgtRotationScriptContent {
     # Ne depend d'aucune variable/fonction du script menu (execution differee et decouplee).
     return @'
 # Reset-KrbtgtScheduled.ps1
-# Deploye et execute automatiquement par la tache planifiee "ADHC - Rotation KRBTGT".
+# Deploye et execute automatiquement par la tache planifiee "SEC - Rotation KRBTGT".
 # Ne PAS executer manuellement sans avoir verifie l'etat de replication AD au prealable.
 
 $logFile = "C:\ADHC-Scripts\Krbtgt-Rotation.log"
@@ -1196,7 +1196,7 @@ function Invoke-RiskySetupKrbtgtScheduledRotation {
     Invoke-Guarded -Description ("Creation de la tache planifiee (tous les {0} jours) sur {1}" -f $days, $targetDC) -Action {
         Invoke-Command -ComputerName $targetDC -ScriptBlock {
             param($gmsaSam, $domainNetbios, $intervalDays)
-            $taskName = "ADHC - Rotation KRBTGT"
+            $taskName = "SEC - Rotation KRBTGT"
             $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument '-NoProfile -ExecutionPolicy Bypass -File "C:\ADHC-Scripts\Reset-KrbtgtScheduled.ps1"'
             $trigger = New-ScheduledTaskTrigger -Daily -DaysInterval $intervalDays -At "02:00"
             $principal = New-ScheduledTaskPrincipal -UserId "$domainNetbios\$gmsaSam`$" -LogonType Password -RunLevel Highest
@@ -1207,7 +1207,7 @@ function Invoke-RiskySetupKrbtgtScheduledRotation {
         } -ArgumentList $gmsaName, $domainNetbios, $days -ErrorAction Stop
     }
 
-    Write-Log ("Tache planifiee 'ADHC - Rotation KRBTGT' creee sur {0}, execution tous les {1} jours a 02:00, sous le compte {2}\{3}$." -f $targetDC, $days, $domainNetbios, $gmsaName) -Level OK
+    Write-Log ("Tache planifiee 'SEC - Rotation KRBTGT' creee sur {0}, execution tous les {1} jours a 02:00, sous le compte {2}\{3}$." -f $targetDC, $days, $domainNetbios, $gmsaName) -Level OK
     Write-Log "Journal local sur le DC : C:\ADHC-Scripts\Krbtgt-Rotation.log (+ journal d'evenements Application, source ADHC-KrbtgtRotation)." -Level INFO
     Write-Log "Chaque execution verifie l'etat de la replication AD (repadmin /replsummary) avant d'agir : en cas d'anomalie, la rotation est annulee automatiquement." -Level INFO
 }
@@ -1232,7 +1232,7 @@ function Invoke-RiskyDisableNtlmV1 {
     }
     Import-Module GroupPolicy -ErrorAction SilentlyContinue
 
-    $gpoName = "ADHC - Durcissement NTLM (LmCompatibilityLevel=$level)"
+    $gpoName = "SEC - Durcissement NTLM (LmCompatibilityLevel=$level)"
     if (-not (Confirm-Action ("Creer/lier la GPO '{0}' au niveau du domaine" -f $gpoName) -Strong)) { return }
 
     Invoke-Guarded -Description ("GPO LmCompatibilityLevel=$level") -Action {
@@ -1259,7 +1259,7 @@ function Invoke-Remediate6RestrictNtlmOutgoing {
     $exceptions = Read-Host "Serveurs exceptes (NTLM autorise vers eux), noms separes par une virgule (vide = aucune exception)"
     $exceptionList = @($exceptions -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 
-    $gpoName = "ADHC - Restriction NTLM sortant (Deny)"
+    $gpoName = "SEC - Restriction NTLM sortant (Deny)"
     if (-not (Confirm-Action ("Creer/lier la GPO '{0}' sur l'OU Domain Controllers (NTLM sortant refuse, {1} exception(s))" -f $gpoName, $exceptionList.Count) -Strong)) { return }
 
     $ouDCs = "OU=Domain Controllers,$((Get-ADDomain).DistinguishedName)"
@@ -1396,8 +1396,8 @@ function Invoke-Remediate5EnableKerberosArmoring {
     $ouDCs = "OU=Domain Controllers,$((Get-ADDomain).DistinguishedName)"
     $targetOUs = @(Select-OUsInteractive -Label "les clients Kerberos Armoring" -Verb "CIBLER (en plus des DC)")
 
-    $gpoNameDc = "ADHC - Kerberos Armoring (DC)"
-    $gpoNameClient = "ADHC - Kerberos Armoring (Clients)"
+    $gpoNameDc = "SEC - Kerberos Armoring (DC)"
+    $gpoNameClient = "SEC - Kerberos Armoring (Clients)"
     if (-not (Confirm-Action ("Creer/lier '{0}' sur l'OU Domain Controllers, et '{1}' sur {2} UO client(s)" -f $gpoNameDc, $gpoNameClient, $targetOUs.Count) -Strong)) { return }
 
     Invoke-Guarded -Description ("Creation/MAJ de la GPO {0}" -f $gpoNameDc) -Action {
@@ -1710,7 +1710,7 @@ function Invoke-Remediate9EnableFirewallBaseline {
     }
     Import-Module GroupPolicy -ErrorAction SilentlyContinue
 
-    $gpoName = "ADHC - Pare-feu Windows actif (DC)"
+    $gpoName = "SEC - Pare-feu Windows actif (DC)"
     if (-not (Confirm-Action ("Creer/lier la GPO '{0}' sur l'OU Domain Controllers (pare-feu actif, 3 profils)" -f $gpoName) -Strong)) { return }
 
     $ouDCs = "OU=Domain Controllers,$((Get-ADDomain).DistinguishedName)"
@@ -1763,7 +1763,7 @@ function Invoke-RiskyDisableLLMNR {
     }
     Import-Module GroupPolicy -ErrorAction SilentlyContinue
 
-    $gpoName = "ADHC - Desactivation LLMNR"
+    $gpoName = "SEC - Desactivation LLMNR"
     if (-not (Confirm-Action ("Creer la GPO '{0}' (non liee automatiquement)" -f $gpoName) -Strong)) { return }
 
     Invoke-Guarded -Description "Creation GPO LLMNR" -Action {
@@ -2285,7 +2285,7 @@ function Invoke-Remediate7EnforceSmbSigning {
     }
     Import-Module GroupPolicy -ErrorAction SilentlyContinue
 
-    $gpoName = "ADHC - Signature SMB obligatoire"
+    $gpoName = "SEC - Signature SMB obligatoire"
     if (-not (Confirm-Action ("Creer/lier la GPO '{0}' sur l'OU Domain Controllers (signature client+serveur obligatoire)" -f $gpoName) -Strong)) { return }
 
     $ouDCs = "OU=Domain Controllers,$((Get-ADDomain).DistinguishedName)"
@@ -2313,7 +2313,7 @@ function Invoke-Remediate7HardenedUncPaths {
     }
     Import-Module GroupPolicy -ErrorAction SilentlyContinue
 
-    $gpoName = "ADHC - Hardened UNC Paths (SYSVOL-NETLOGON)"
+    $gpoName = "SEC - Hardened UNC Paths (SYSVOL-NETLOGON)"
     if (-not (Confirm-Action ("Creer la GPO '{0}' (non liee automatiquement)" -f $gpoName) -Strong)) { return }
 
     Invoke-Guarded -Description ("Creation/MAJ de la GPO {0}" -f $gpoName) -Action {
@@ -2742,7 +2742,7 @@ function Invoke-Remediate4DenyInteractiveLogon {
         Add-ADGroupMember -Identity $groupName -Members ($selected | Select-Object -ExpandProperty SID) -ErrorAction SilentlyContinue
     }
 
-    $gpoName = "ADHC - Comptes de service - Interdiction logon interactif"
+    $gpoName = "SEC - Comptes de service - Interdiction logon interactif"
     Invoke-Guarded -Description ("Creation/lien de la GPO '{0}'" -f $gpoName) -Action {
         $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
         if (-not $gpo) { $gpo = New-GPO -Name $gpoName }
@@ -2976,7 +2976,7 @@ function Invoke-Remediate10DeployGpo {
     $targetOUs = @(Select-OUsInteractive -Label "la GPO Windows LAPS" -Verb "CIBLER (lien de la GPO)")
     if ($targetOUs.Count -eq 0) { Write-Log "Aucune UO ciblee, action annulee." -Level WARN; return }
 
-    $gpoName = "ADHC - Windows LAPS"
+    $gpoName = "SEC - Windows LAPS"
     $backupLabel = if ($hybrid) { 'Entra ID' } else { 'Active Directory' }
     if (-not (Confirm-Action ("Creer/MAJ la GPO '{0}' (longueur={1}, age max={2}j, sauvegarde={3}) et la lier sur {4} UO" -f $gpoName, $length, $age, $backupLabel, $targetOUs.Count) -Strong)) { return }
 
@@ -3035,7 +3035,7 @@ function Invoke-Remediate10SetPermissions {
 #  Sauvegarde de toutes les GPO avant modification sensible, et creation du
 #  socle GPO-SEC-* nomme demande par le cahier des charges. Les remediations
 #  thematiques de ce script (LAPS, NTLM, SMB, LLMNR...) continuent pour
-#  l'instant de creer leurs propres GPO "ADHC - ..." dediees : ce theme cree
+#  l'instant de creer leurs propres GPO "SEC - ..." dediees : ce theme cree
 #  les 9 GPO-SEC-* en COMPLEMENT (coquilles vides a peupler progressivement),
 #  sans toucher aux GPO existantes.
 # ============================================================
@@ -3112,7 +3112,7 @@ function Invoke-Remediate12CreateBaselineGpoShells {
     Write-Host "         et SANS AUCUN lien vers une OU (donc sans effet tant qu'elles ne sont pas remplies" -ForegroundColor DarkGray
     Write-Host "         et liees deliberement)." -ForegroundColor DarkGray
     Write-Host "Les remediations thematiques de ce script (LAPS, NTLM, SMB, LLMNR...) continuent pour" -ForegroundColor DarkGray
-    Write-Host "l'instant de creer leurs propres GPO 'ADHC - ...' dediees : ce socle nomme est un point de" -ForegroundColor DarkGray
+    Write-Host "l'instant de creer leurs propres GPO 'SEC - ...' dediees : ce socle nomme est un point de" -ForegroundColor DarkGray
     Write-Host "depart a completer manuellement (ou lors d'une prochaine evolution du script)." -ForegroundColor DarkGray
 
     if (-not (Get-Module -ListAvailable -Name GroupPolicy)) {
@@ -3251,7 +3251,7 @@ function Invoke-Remediate13EnableDefenderProtections {
         "D3E037E1-3EB8-44C8-A917-57927947596D"
     )
 
-    $gpoName = "ADHC - Defender Hardening"
+    $gpoName = "SEC - Defender Hardening"
     if (-not (Confirm-Action ("Creer/MAJ la GPO '{0}' (Cloud+Reseau+SmartScreen actifs, {1} regles ASR en mode {2}) et la lier sur {3} UO" -f $gpoName, $asrRules.Count, $modeLabel, $targetOUs.Count) -Strong)) { return }
 
     Invoke-Guarded -Description ("Creation/MAJ de la GPO {0}" -f $gpoName) -Action {
@@ -3290,7 +3290,7 @@ function Invoke-Remediate13RestrictRdp {
     $targetOUs = @(Select-OUsInteractive -Label "la GPO de restriction RDP" -Verb "CIBLER (lien de la GPO)")
     if ($targetOUs.Count -eq 0) { Write-Log "Aucune UO ciblee, action annulee." -Level WARN; return }
 
-    $gpoName = "ADHC - Restriction RDP (NLA)"
+    $gpoName = "SEC - Restriction RDP (NLA)"
     if (-not (Confirm-Action ("Creer/MAJ la GPO '{0}' (NLA obligatoire, chiffrement eleve) et la lier sur {1} UO" -f $gpoName, $targetOUs.Count) -Strong)) { return }
 
     Invoke-Guarded -Description ("Creation/MAJ de la GPO {0}" -f $gpoName) -Action {
@@ -3368,7 +3368,7 @@ function Invoke-Remediate13EnablePowerShellLoggingExtended {
     $targetOUs = @(Select-OUsInteractive -Label "l'extension de la journalisation PowerShell" -Verb "CIBLER (lien de la GPO)")
     if ($targetOUs.Count -eq 0) { Write-Log "Aucune UO ciblee, action annulee." -Level WARN; return }
 
-    $gpoName = "ADHC - Audit PowerShell Logging"
+    $gpoName = "SEC - Audit PowerShell Logging"
     if (-not (Confirm-Action ("Lier la GPO '{0}' (creee si absente) sur {1} UO supplementaire(s)" -f $gpoName, $targetOUs.Count))) { return }
 
     Invoke-Guarded -Description ("Extension de la GPO {0}" -f $gpoName) -Action {
@@ -3398,7 +3398,7 @@ function Invoke-Remediate13DisableWindowsScriptHost {
     $targetOUs = @(Select-OUsInteractive -Label "le blocage Windows Script Host" -Verb "CIBLER (lien de la GPO)")
     if ($targetOUs.Count -eq 0) { Write-Log "Aucune UO ciblee, action annulee." -Level WARN; return }
 
-    $gpoName = "ADHC - Blocage Windows Script Host"
+    $gpoName = "SEC - Blocage Windows Script Host"
     if (-not (Confirm-Action ("Creer/MAJ la GPO '{0}' et la lier sur {1} UO" -f $gpoName, $targetOUs.Count) -Strong)) { return }
 
     Invoke-Guarded -Description ("Creation/MAJ de la GPO {0}" -f $gpoName) -Action {
@@ -3425,7 +3425,7 @@ function Invoke-Remediate13EnableFirewallBaseline {
     $targetOUs = @(Select-OUsInteractive -Label "la GPO de pare-feu" -Verb "CIBLER (lien de la GPO)")
     if ($targetOUs.Count -eq 0) { Write-Log "Aucune UO ciblee, action annulee." -Level WARN; return }
 
-    $gpoName = "ADHC - Pare-feu Windows actif (Postes-Serveurs)"
+    $gpoName = "SEC - Pare-feu Windows actif (Postes-Serveurs)"
     if (-not (Confirm-Action ("Creer/MAJ la GPO '{0}' et la lier sur {1} UO" -f $gpoName, $targetOUs.Count) -Strong)) { return }
 
     Invoke-Guarded -Description ("Creation/MAJ de la GPO {0}" -f $gpoName) -Action {
@@ -3540,7 +3540,7 @@ function Invoke-Remediate14RestrictRpc {
     $targetOUs = @(Select-OUsInteractive -Label "la GPO de durcissement RPC" -Verb "CIBLER (lien de la GPO)")
     if ($targetOUs.Count -eq 0) { Write-Log "Aucune UO ciblee, action annulee." -Level WARN; return }
 
-    $gpoName = "ADHC - Durcissement RPC"
+    $gpoName = "SEC - Durcissement RPC"
     if (-not (Confirm-Action ("Creer/MAJ la GPO '{0}' et la lier sur {1} UO" -f $gpoName, $targetOUs.Count) -Strong)) { return }
 
     Invoke-Guarded -Description ("Creation/MAJ de la GPO {0}" -f $gpoName) -Action {
@@ -3569,7 +3569,7 @@ function Invoke-Remediate14RestrictWinRm {
     $targetOUs = @(Select-OUsInteractive -Label "la GPO de durcissement WinRM" -Verb "CIBLER (lien de la GPO)")
     if ($targetOUs.Count -eq 0) { Write-Log "Aucune UO ciblee, action annulee." -Level WARN; return }
 
-    $gpoName = "ADHC - Durcissement WinRM"
+    $gpoName = "SEC - Durcissement WinRM"
     if (-not (Confirm-Action ("Creer/MAJ la GPO '{0}' (Basic desactive, trafic chiffre obligatoire, client+serveur) et la lier sur {1} UO" -f $gpoName, $targetOUs.Count) -Strong)) { return }
 
     Invoke-Guarded -Description ("Creation/MAJ de la GPO {0}" -f $gpoName) -Action {
@@ -3600,7 +3600,7 @@ function Invoke-Remediate14RestrictSamEnumeration {
     $targetOUs = @(Select-OUsInteractive -Label "la restriction SAMR" -Verb "CIBLER (lien de la GPO)")
     if ($targetOUs.Count -eq 0) { Write-Log "Aucune UO ciblee, action annulee." -Level WARN; return }
 
-    $gpoName = "ADHC - Restriction enumeration SAMR"
+    $gpoName = "SEC - Restriction enumeration SAMR"
     if (-not (Confirm-Action ("Creer/MAJ la GPO '{0}' (SAMR reserve aux administrateurs locaux) et la lier sur {1} UO" -f $gpoName, $targetOUs.Count) -Strong)) { return }
 
     Invoke-Guarded -Description ("Creation/MAJ de la GPO {0}" -f $gpoName) -Action {
@@ -3727,7 +3727,7 @@ function Invoke-Remediate17ScheduleSystemStateBackup {
     Invoke-Guarded -Description ("Creation de la tache planifiee de sauvegarde System State sur {0}" -f $targetDC) -Action {
         Invoke-Command -ComputerName $targetDC -ScriptBlock {
             param($backupTarget, $time)
-            $taskName = "ADHC - Sauvegarde System State"
+            $taskName = "SEC - Sauvegarde System State"
             $action = New-ScheduledTaskAction -Execute "wbadmin.exe" -Argument "start systemstatebackup -backupTarget:$backupTarget -quiet"
             $trigger = New-ScheduledTaskTrigger -Daily -At $time
             $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
@@ -4042,7 +4042,7 @@ function Invoke-Remediate19ConfigureEventForwarding {
     if ([string]::IsNullOrWhiteSpace($collector)) { Write-Log "URL vide, action annulee." -Level WARN; return }
 
     $ouDCs = "OU=Domain Controllers,$((Get-ADDomain).DistinguishedName)"
-    $gpoName = "ADHC - Redirection journaux (WEF)"
+    $gpoName = "SEC - Redirection journaux (WEF)"
     if (-not (Confirm-Action ("Creer/lier la GPO '{0}' sur l'OU Domain Controllers (collecteur : {1})" -f $gpoName, $collector) -Strong)) { return }
 
     Invoke-Guarded -Description ("Creation/MAJ de la GPO {0}" -f $gpoName) -Action {
@@ -4315,7 +4315,7 @@ function Get-DisableByDateScheduledScriptContent {
 
     $body = @'
 # Disable-ByDate.ps1
-# Deploye et execute automatiquement par la tache planifiee "ADHC - Desactivation Auto (date/anciennete)".
+# Deploye et execute automatiquement par la tache planifiee "SEC - Desactivation Auto (date/anciennete)".
 # Ne PAS executer manuellement sans avoir revu les parametres et exclusions ci-dessus.
 
 $logFile = "C:\ADHC-Scripts\Disable-ByDate.log"
@@ -4593,7 +4593,7 @@ function Invoke-AutomationSetupScheduledTask {
     Invoke-Guarded -Description ("Creation de la tache planifiee (tous les {0} jours) sur {1}" -f $daysInterval, $targetDC) -Action {
         Invoke-Command -ComputerName $targetDC -ScriptBlock {
             param($gmsaSam, $domainNetbios, $intervalDays)
-            $taskName = "ADHC - Desactivation Auto (date/anciennete)"
+            $taskName = "SEC - Desactivation Auto (date/anciennete)"
             $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument '-NoProfile -ExecutionPolicy Bypass -File "C:\ADHC-Scripts\Disable-ByDate.ps1"'
             $trigger = New-ScheduledTaskTrigger -Daily -DaysInterval $intervalDays -At "03:00"
             $principal = New-ScheduledTaskPrincipal -UserId "$domainNetbios\$gmsaSam`$" -LogonType Password -RunLevel Highest
@@ -4604,7 +4604,7 @@ function Invoke-AutomationSetupScheduledTask {
         } -ArgumentList $gmsaName, $domainNetbios, $daysInterval -ErrorAction Stop
     }
 
-    Write-Log ("Tache planifiee 'ADHC - Desactivation Auto (date/anciennete)' creee sur {0}, execution tous les {1} jours a 03:00, sous le compte {2}\{3}$." -f $targetDC, $daysInterval, $domainNetbios, $gmsaName) -Level OK
+    Write-Log ("Tache planifiee 'SEC - Desactivation Auto (date/anciennete)' creee sur {0}, execution tous les {1} jours a 03:00, sous le compte {2}\{3}$." -f $targetDC, $daysInterval, $domainNetbios, $gmsaName) -Level OK
     Write-Log "Journal local sur le DC : C:\ADHC-Scripts\Disable-ByDate.log (+ journal d'evenements Application, source ADHC-AutoDisable)." -Level INFO
     Write-Log "Pour changer les seuils/exclusions, relancez cette configuration : elle regenere et remplace le script deploye et la tache." -Level INFO
 }
@@ -4613,7 +4613,7 @@ function Invoke-AutomationShowStatus {
     Write-Host "`n--- Etat de la tache planifiee de desactivation automatique ---" -ForegroundColor Magenta
     $dcs = Get-DomainControllersList
     if (-not $dcs) { return }
-    $taskName = "ADHC - Desactivation Auto (date/anciennete)"
+    $taskName = "SEC - Desactivation Auto (date/anciennete)"
     foreach ($dc in $dcs) {
         try {
             $task = Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
@@ -4647,7 +4647,7 @@ function Invoke-AutomationRemoveScheduledTask {
 
     Invoke-Guarded -Description ("Suppression de la tache planifiee sur {0}" -f $targetDC) -Action {
         Invoke-Command -ComputerName $targetDC -ScriptBlock {
-            Unregister-ScheduledTask -TaskName "ADHC - Desactivation Auto (date/anciennete)" -Confirm:$false -ErrorAction Stop
+            Unregister-ScheduledTask -TaskName "SEC - Desactivation Auto (date/anciennete)" -Confirm:$false -ErrorAction Stop
         } -ErrorAction Stop
     }
 }
