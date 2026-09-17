@@ -1,4 +1,4 @@
-<#
+﻿<#
     AD_Remediation_Menu.ps1
     ------------------------------------------------------------------
     Script de remediation Active Directory a menu, base sur les constats
@@ -4659,13 +4659,13 @@ function Invoke-AutomationRemoveScheduledTask {
 $Script:ThemeNames = [ordered]@{
     1  = "Comptes a privileges"
     2  = "Comptes de service"
-    3  = "Kerberos et delegations"
-    4  = "NTLM / LM"
-    5  = "SMB, SYSVOL et NETLOGON"
-    6  = "LDAP / LDAPS"
-    7  = "Controleurs de domaine"
-    8  = "Windows LAPS"
-    9  = "Mots de passe et authentification"
+    3  = "Mots de passe et authentification"
+    4  = "Kerberos et delegations"
+    5  = "NTLM / LM"
+    6  = "SMB, SYSVOL et NETLOGON"
+    7  = "LDAP / LDAPS"
+    8  = "Controleurs de domaine"
+    9  = "Windows LAPS"
     10 = "GPO de durcissement (socle GPO-SEC-*)"
     11 = "Postes et serveurs membres"
     12 = "Reseau et anti-relay"
@@ -4704,57 +4704,57 @@ $Script:ActionIndex = @(
     [PSCustomObject]@{ Theme=2; Item=6; Label="(A VALIDER) Reinitialiser le mot de passe des comptes selectionnes" }
     [PSCustomObject]@{ Theme=2; Item=7; Label="(A VALIDER) Assistant de creation d'un compte de service gere (gMSA)" }
 
-    [PSCustomObject]@{ Theme=3; Item=1; Label="Rapport des delegations Kerberos (non contrainte/contrainte/RBCD)" }
-    [PSCustomObject]@{ Theme=3; Item=2; Label="Audit AS-REP Roasting (comptes sans pre-authentification)" }
-    [PSCustomObject]@{ Theme=3; Item=3; Label="Audit des relations d'approbation (trusts) et de leur chiffrement" }
-    [PSCustomObject]@{ Theme=3; Item=4; Label="(A VALIDER) Reinitialiser le mot de passe KRBTGT (1 des 2 executions requises)" }
-    [PSCustomObject]@{ Theme=3; Item=5; Label="(A VALIDER) Configurer la rotation KRBTGT automatique planifiee" }
-    [PSCustomObject]@{ Theme=3; Item=6; Label="(A VALIDER) Desactiver DES et forcer AES sur les comptes concernes" }
-    [PSCustomObject]@{ Theme=3; Item=7; Label="(A VALIDER) Corriger l'exposition AS-REP Roasting" }
-    [PSCustomObject]@{ Theme=3; Item=8; Label="(A VALIDER) Activer Kerberos Armoring (FAST)" }
+    [PSCustomObject]@{ Theme=4; Item=1; Label="Rapport des delegations Kerberos (non contrainte/contrainte/RBCD)" }
+    [PSCustomObject]@{ Theme=4; Item=2; Label="Audit AS-REP Roasting (comptes sans pre-authentification)" }
+    [PSCustomObject]@{ Theme=4; Item=3; Label="Audit des relations d'approbation (trusts) et de leur chiffrement" }
+    [PSCustomObject]@{ Theme=4; Item=4; Label="(A VALIDER) Reinitialiser le mot de passe KRBTGT (1 des 2 executions requises)" }
+    [PSCustomObject]@{ Theme=4; Item=5; Label="(A VALIDER) Configurer la rotation KRBTGT automatique planifiee" }
+    [PSCustomObject]@{ Theme=4; Item=6; Label="(A VALIDER) Desactiver DES et forcer AES sur les comptes concernes" }
+    [PSCustomObject]@{ Theme=4; Item=7; Label="(A VALIDER) Corriger l'exposition AS-REP Roasting" }
+    [PSCustomObject]@{ Theme=4; Item=8; Label="(A VALIDER) Activer Kerberos Armoring (FAST)" }
 
-    [PSCustomObject]@{ Theme=4; Item=1; Label="(SAFE) Activer l'audit NTLM (detection avant tout blocage)" }
-    [PSCustomObject]@{ Theme=4; Item=2; Label="Rapport NTLMv1/LM detecte (journal Securite des DC)" }
-    [PSCustomObject]@{ Theme=4; Item=3; Label="(A VALIDER) Desactiver NTLMv1/LM (LmCompatibilityLevel) via GPO" }
-    [PSCustomObject]@{ Theme=4; Item=4; Label="(A VALIDER) Restriction progressive de NTLM sortant (Deny avec exceptions)" }
+    [PSCustomObject]@{ Theme=5; Item=1; Label="(SAFE) Activer l'audit NTLM (detection avant tout blocage)" }
+    [PSCustomObject]@{ Theme=5; Item=2; Label="Rapport NTLMv1/LM detecte (journal Securite des DC)" }
+    [PSCustomObject]@{ Theme=5; Item=3; Label="(A VALIDER) Desactiver NTLMv1/LM (LmCompatibilityLevel) via GPO" }
+    [PSCustomObject]@{ Theme=5; Item=4; Label="(A VALIDER) Restriction progressive de NTLM sortant (Deny avec exceptions)" }
 
-    [PSCustomObject]@{ Theme=5; Item=1; Label="Detection de l'usage SMBv1 (active l'audit si besoin, puis lit le journal)" }
-    [PSCustomObject]@{ Theme=5; Item=2; Label="Etat de la signature SMB (client/serveur) sur les DC" }
-    [PSCustomObject]@{ Theme=5; Item=3; Label="Audit des partages SMB sur des postes/serveurs choisis" }
-    [PSCustomObject]@{ Theme=5; Item=4; Label="(A VALIDER) Desactiver SMBv1 (client + serveur) sur les DC" }
-    [PSCustomObject]@{ Theme=5; Item=5; Label="(A VALIDER) Desactiver SMBv1 sur des postes/serveurs choisis" }
-    [PSCustomObject]@{ Theme=5; Item=6; Label="(A VALIDER) Forcer la signature SMB (client + serveur) via GPO" }
-    [PSCustomObject]@{ Theme=5; Item=7; Label="(A VALIDER) Durcir les chemins UNC SYSVOL/NETLOGON (Hardened UNC Paths)" }
+    [PSCustomObject]@{ Theme=6; Item=1; Label="Detection de l'usage SMBv1 (active l'audit si besoin, puis lit le journal)" }
+    [PSCustomObject]@{ Theme=6; Item=2; Label="Etat de la signature SMB (client/serveur) sur les DC" }
+    [PSCustomObject]@{ Theme=6; Item=3; Label="Audit des partages SMB sur des postes/serveurs choisis" }
+    [PSCustomObject]@{ Theme=6; Item=4; Label="(A VALIDER) Desactiver SMBv1 (client + serveur) sur les DC" }
+    [PSCustomObject]@{ Theme=6; Item=5; Label="(A VALIDER) Desactiver SMBv1 sur des postes/serveurs choisis" }
+    [PSCustomObject]@{ Theme=6; Item=6; Label="(A VALIDER) Forcer la signature SMB (client + serveur) via GPO" }
+    [PSCustomObject]@{ Theme=6; Item=7; Label="(A VALIDER) Durcir les chemins UNC SYSVOL/NETLOGON (Hardened UNC Paths)" }
 
-    [PSCustomObject]@{ Theme=6; Item=1; Label="Audit des certificats LDAPS et joignabilite du port 636" }
-    [PSCustomObject]@{ Theme=6; Item=2; Label="Audit des Simple Binds LDAP non signes (evenement 2887)" }
-    [PSCustomObject]@{ Theme=6; Item=3; Label="(A VALIDER) Forcer la signature LDAP / channel binding sur les DC" }
-    [PSCustomObject]@{ Theme=6; Item=4; Label="(A VALIDER) Desactiver TLS 1.0/1.1 et activer TLS 1.2+ (SCHANNEL)" }
-    [PSCustomObject]@{ Theme=6; Item=5; Label="(A VALIDER) Restreindre les operations LDAP anonymes (dSHeuristics)" }
+    [PSCustomObject]@{ Theme=7; Item=1; Label="Audit des certificats LDAPS et joignabilite du port 636" }
+    [PSCustomObject]@{ Theme=7; Item=2; Label="Audit des Simple Binds LDAP non signes (evenement 2887)" }
+    [PSCustomObject]@{ Theme=7; Item=3; Label="(A VALIDER) Forcer la signature LDAP / channel binding sur les DC" }
+    [PSCustomObject]@{ Theme=7; Item=4; Label="(A VALIDER) Desactiver TLS 1.0/1.1 et activer TLS 1.2+ (SCHANNEL)" }
+    [PSCustomObject]@{ Theme=7; Item=5; Label="(A VALIDER) Restreindre les operations LDAP anonymes (dSHeuristics)" }
 
-    [PSCustomObject]@{ Theme=7; Item=1;  Label="Rapport des hotfix installes sur les DC" }
-    [PSCustomObject]@{ Theme=7; Item=2;  Label="Etat de la synchronisation horaire (NTP)" }
-    [PSCustomObject]@{ Theme=7; Item=3;  Label="Roles et fonctionnalites installes sur les DC" }
-    [PSCustomObject]@{ Theme=7; Item=4;  Label="(SAFE) Activer PowerShell Remoting (WinRM) sur les DC injoignables" }
-    [PSCustomObject]@{ Theme=7; Item=5;  Label="(SAFE) Desactiver le compte Invite (Guest) s'il est actif" }
-    [PSCustomObject]@{ Theme=7; Item=6;  Label="(SAFE) Proteger toutes les OU contre la suppression accidentelle" }
-    [PSCustomObject]@{ Theme=7; Item=7;  Label="(SAFE) Limiter le quota de creation d'ordinateurs (ms-DS-MachineAccountQuota = 0)" }
-    [PSCustomObject]@{ Theme=7; Item=8;  Label="(A VALIDER) Arreter/desactiver le service Spooler sur les DC" }
-    [PSCustomObject]@{ Theme=7; Item=9;  Label="(A VALIDER) Configurer la source NTP externe du PDC Emulator" }
-    [PSCustomObject]@{ Theme=7; Item=10; Label="(A VALIDER) Activer le pare-feu Windows (3 profils) sur les DC" }
+    [PSCustomObject]@{ Theme=8; Item=1;  Label="Rapport des hotfix installes sur les DC" }
+    [PSCustomObject]@{ Theme=8; Item=2;  Label="Etat de la synchronisation horaire (NTP)" }
+    [PSCustomObject]@{ Theme=8; Item=3;  Label="Roles et fonctionnalites installes sur les DC" }
+    [PSCustomObject]@{ Theme=8; Item=4;  Label="(SAFE) Activer PowerShell Remoting (WinRM) sur les DC injoignables" }
+    [PSCustomObject]@{ Theme=8; Item=5;  Label="(SAFE) Desactiver le compte Invite (Guest) s'il est actif" }
+    [PSCustomObject]@{ Theme=8; Item=6;  Label="(SAFE) Proteger toutes les OU contre la suppression accidentelle" }
+    [PSCustomObject]@{ Theme=8; Item=7;  Label="(SAFE) Limiter le quota de creation d'ordinateurs (ms-DS-MachineAccountQuota = 0)" }
+    [PSCustomObject]@{ Theme=8; Item=8;  Label="(A VALIDER) Arreter/desactiver le service Spooler sur les DC" }
+    [PSCustomObject]@{ Theme=8; Item=9;  Label="(A VALIDER) Configurer la source NTP externe du PDC Emulator" }
+    [PSCustomObject]@{ Theme=8; Item=10; Label="(A VALIDER) Activer le pare-feu Windows (3 profils) sur les DC" }
 
-    [PSCustomObject]@{ Theme=8; Item=1; Label="Etat du deploiement LAPS (schema, couverture)" }
-    [PSCustomObject]@{ Theme=8; Item=2; Label="Audit des droits de lecture/reset du mot de passe LAPS" }
-    [PSCustomObject]@{ Theme=8; Item=3; Label="(A VALIDER) Preparer le schema Active Directory pour LAPS" }
-    [PSCustomObject]@{ Theme=8; Item=4; Label="(A VALIDER) Deployer la GPO Windows LAPS" }
-    [PSCustomObject]@{ Theme=8; Item=5; Label="(A VALIDER) Configurer les droits de lecture/reset LAPS" }
+    [PSCustomObject]@{ Theme=9; Item=1; Label="Etat du deploiement LAPS (schema, couverture)" }
+    [PSCustomObject]@{ Theme=9; Item=2; Label="Audit des droits de lecture/reset du mot de passe LAPS" }
+    [PSCustomObject]@{ Theme=9; Item=3; Label="(A VALIDER) Preparer le schema Active Directory pour LAPS" }
+    [PSCustomObject]@{ Theme=9; Item=4; Label="(A VALIDER) Deployer la GPO Windows LAPS" }
+    [PSCustomObject]@{ Theme=9; Item=5; Label="(A VALIDER) Configurer les droits de lecture/reset LAPS" }
 
-    [PSCustomObject]@{ Theme=9; Item=1; Label="Rapport des comptes avec mot de passe n'expirant jamais" }
-    [PSCustomObject]@{ Theme=9; Item=2; Label="Audit de la politique de mot de passe par defaut du domaine" }
-    [PSCustomObject]@{ Theme=9; Item=3; Label="(SAFE) Retirer le flag 'Mot de passe non requis' sur les comptes concernes" }
-    [PSCustomObject]@{ Theme=9; Item=4; Label="(A VALIDER) Corriger la politique de mot de passe par defaut du domaine" }
-    [PSCustomObject]@{ Theme=9; Item=5; Label="(A VALIDER) Creer une Fine-Grained Password Policy pour les comptes de service" }
-    [PSCustomObject]@{ Theme=9; Item=6; Label="(SAFE) Generer les recommandations MFA / Conditional Access (hybride)" }
+    [PSCustomObject]@{ Theme=3; Item=1; Label="Rapport des comptes avec mot de passe n'expirant jamais" }
+    [PSCustomObject]@{ Theme=3; Item=2; Label="Audit de la politique de mot de passe par defaut du domaine" }
+    [PSCustomObject]@{ Theme=3; Item=3; Label="(SAFE) Retirer le flag 'Mot de passe non requis' sur les comptes concernes" }
+    [PSCustomObject]@{ Theme=3; Item=4; Label="(A VALIDER) Corriger la politique de mot de passe par defaut du domaine" }
+    [PSCustomObject]@{ Theme=3; Item=5; Label="(A VALIDER) Creer une Fine-Grained Password Policy pour les comptes de service" }
+    [PSCustomObject]@{ Theme=3; Item=6; Label="(SAFE) Generer les recommandations MFA / Conditional Access (hybride)" }
 
     [PSCustomObject]@{ Theme=10; Item=1; Label="Etat du socle GPO-SEC-* et des sauvegardes de GPO" }
     [PSCustomObject]@{ Theme=10; Item=2; Label="(SAFE) Sauvegarder TOUTES les GPO du domaine" }
@@ -5334,17 +5334,17 @@ function Show-MainMenu {
         Write-MenuCategory "Identite et comptes"
         Write-MenuItem "1" "Comptes a privileges" -Color Cyan
         Write-MenuItem "2" "Comptes de service" -Color Cyan
-        Write-MenuItem "9" "Mots de passe et authentification" -Color Cyan
+        Write-MenuItem "3" "Mots de passe et authentification" -Color Cyan
 
         Write-MenuCategory "Authentification et protocoles"
-        Write-MenuItem "3" "Kerberos et delegations" -Color Cyan
-        Write-MenuItem "4" "NTLM / LM" -Color Cyan
-        Write-MenuItem "5" "SMB, SYSVOL et NETLOGON" -Color Cyan
-        Write-MenuItem "6" "LDAP / LDAPS" -Color Cyan
+        Write-MenuItem "4" "Kerberos et delegations" -Color Cyan
+        Write-MenuItem "5" "NTLM / LM" -Color Cyan
+        Write-MenuItem "6" "SMB, SYSVOL et NETLOGON" -Color Cyan
+        Write-MenuItem "7" "LDAP / LDAPS" -Color Cyan
 
         Write-MenuCategory "Infrastructure"
-        Write-MenuItem "7"  "Controleurs de domaine" -Color Cyan
-        Write-MenuItem "8"  "Windows LAPS" -Color Cyan
+        Write-MenuItem "8"  "Controleurs de domaine" -Color Cyan
+        Write-MenuItem "9"  "Windows LAPS" -Color Cyan
         Write-MenuItem "10" "GPO de durcissement (socle GPO-SEC-*)" -Color Cyan
         Write-MenuItem "11" "Postes et serveurs membres" -Color Cyan
         Write-MenuItem "12" "Reseau et anti-relay" -Color Cyan
@@ -5367,13 +5367,13 @@ function Show-MainMenu {
         switch ($choice.ToUpper()) {
             "1"  { Show-PrivilegedAccountsMenu }
             "2"  { Show-ServiceAccountsMenu }
-            "3"  { Show-KerberosMenu }
-            "4"  { Show-NtlmMenu }
-            "5"  { Show-SmbSysvolMenu }
-            "6"  { Show-LdapMenu }
-            "7"  { Show-DomainControllersMenu }
-            "8"  { Show-LapsMenu }
-            "9"  { Show-PasswordAuthMenu }
+            "3"  { Show-PasswordAuthMenu }
+            "4"  { Show-KerberosMenu }
+            "5"  { Show-NtlmMenu }
+            "6"  { Show-SmbSysvolMenu }
+            "7"  { Show-LdapMenu }
+            "8"  { Show-DomainControllersMenu }
+            "9"  { Show-LapsMenu }
             "10" { Show-GpoBaselineMenu }
             "11" { Show-WorkstationsServersMenu }
             "12" { Show-NetworkAntiRelayMenu }
