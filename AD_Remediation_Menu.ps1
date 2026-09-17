@@ -85,6 +85,17 @@ function Show-Banner {
         $dom = Get-ADDomain -ErrorAction Stop
         Write-Host (" Domaine     : {0}" -f $dom.DNSRoot) -ForegroundColor DarkGray
     } catch { }
+    if ($Script:ActionIndex) {
+        Write-Host (" {0} actions disponibles sur 18 themes - [R] au menu principal pour rechercher par mot-cle." -f $Script:ActionIndex.Count) -ForegroundColor DarkGray
+    }
+    Write-Host "================================================================" -ForegroundColor DarkCyan
+    Write-Host " Legende : " -ForegroundColor DarkGray -NoNewline
+    Write-Host "(SAFE) " -ForegroundColor Green -NoNewline
+    Write-Host "sans impact prod   " -ForegroundColor DarkGray -NoNewline
+    Write-Host "(A VALIDER) " -ForegroundColor Red -NoNewline
+    Write-Host "impact potentiel   " -ForegroundColor DarkGray -NoNewline
+    Write-Host "(gris) " -ForegroundColor Gray -NoNewline
+    Write-Host "audit/lecture seule/outillage" -ForegroundColor DarkGray
     Write-Host "================================================================" -ForegroundColor DarkCyan
     Write-Host ""
 }
@@ -176,6 +187,32 @@ function Invoke-Guarded {
 function Pause-Menu {
     Write-Host ""
     Read-Host "Appuyez sur Entree pour revenir au menu"
+}
+
+function Write-MenuItem {
+    <#
+        Affiche une ligne de menu numerotee (alignee sur 2 caracteres), coloree
+        automatiquement selon le tag present dans le libelle : vert pour (SAFE),
+        rouge pour (A VALIDER), gris clair sinon (audit/navigation/outillage) -
+        pour reperer le niveau de risque d'un item au premier coup d'oeil, sans
+        avoir a lire tout le texte. -Color permet de forcer une couleur (utilise
+        par le menu principal pour regrouper les themes par categorie).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Number,
+        [Parameter(Mandatory)][string]$Label,
+        [string]$Color
+    )
+    if (-not $Color) {
+        $Color = if ($Label -match '^\(SAFE\)') { 'Green' } elseif ($Label -match '^\(A VALIDER\)') { 'Red' } else { 'Gray' }
+    }
+    Write-Host (" {0,2}. {1}" -f $Number, $Label) -ForegroundColor $Color
+}
+
+function Write-MenuCategory {
+    param([Parameter(Mandatory)][string]$Text)
+    Write-Host ""
+    Write-Host (" -- {0} --" -f $Text.ToUpper()) -ForegroundColor DarkYellow
 }
 
 function Get-DomainControllersList {
@@ -325,24 +362,58 @@ function Get-ExpandedGroupMemberSids {
     return $sids
 }
 
-function Select-ExclusionOUs {
+function Select-OUsInteractive {
     <#
-        Garde-fou : permet d'exclure certaines UO (comptes de service, serveurs
-        critiques, postes VIP...) des actions de desactivation par date/anciennete.
+        Selecteur d'UO interactif generique et numerote. Reutilise pour choisir des
+        UO a EXCLURE (garde-fous de desactivation) ou a CIBLER (perimetre d'une
+        action : comptes de service, deploiement LAPS...) - seul le libelle change.
     #>
-    param([Parameter(Mandatory)][string]$Label)
+    param(
+        [Parameter(Mandatory)][string]$Label,
+        [string]$Verb = "EXCLURE"
+    )
 
     $ous = @(Get-ADOrganizationalUnit -Filter * -ErrorAction SilentlyContinue | Sort-Object DistinguishedName)
     if (-not $ous) { return @() }
 
     Write-Host ""
-    Write-Host ("UO disponibles a EXCLURE pour {0} :" -f $Label) -ForegroundColor DarkGray
+    Write-Host ("UO disponibles a {0} pour {1} :" -f $Verb, $Label) -ForegroundColor DarkGray
     for ($i = 0; $i -lt $ous.Count; $i++) { Write-Host ("  [{0}] {1}" -f $i, $ous[$i].DistinguishedName) }
-    $sel = Read-Host ("Numeros des UO a exclure pour {0}, separes par une virgule (vide = aucune exclusion)" -f $Label)
+    $sel = Read-Host ("Numeros des UO a {0} pour {1}, separes par une virgule (vide = aucune)" -f $Verb, $Label)
     if ([string]::IsNullOrWhiteSpace($sel)) { return @() }
 
     $idx = @($sel -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ } | Where-Object { $_ -lt $ous.Count })
     return @($idx | ForEach-Object { $ous[$_].DistinguishedName })
+}
+
+function Select-ExclusionOUs {
+    param([Parameter(Mandatory)][string]$Label)
+    return Select-OUsInteractive -Label $Label -Verb "EXCLURE"
+}
+
+function Select-AccountsInteractive {
+    <#
+        Affiche une liste numerotee de comptes et laisse choisir un sous-ensemble
+        (numeros separes par une virgule, 'tous', ou vide pour annuler). Reutilise
+        par les remediations du theme "comptes de service" pour cibler precisement
+        les comptes traites plutot que d'agir sur la liste entiere sans revue.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Accounts,
+        [Parameter(Mandatory)][string]$Prompt
+    )
+
+    if ($Accounts.Count -eq 0) { return @() }
+
+    for ($i = 0; $i -lt $Accounts.Count; $i++) {
+        Write-Host ("  [{0}] {1}" -f $i, $Accounts[$i].SamAccountName)
+    }
+    $sel = Read-Host $Prompt
+    if ([string]::IsNullOrWhiteSpace($sel)) { return @() }
+    if ($sel.Trim() -eq 'tous') { return @($Accounts) }
+
+    $idx = @($sel -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ } | Where-Object { $_ -lt $Accounts.Count })
+    return @($idx | ForEach-Object { $Accounts[$_] })
 }
 
 function Read-ExtraExclusionGroups {
@@ -393,7 +464,8 @@ function Read-DisableCutoffDate {
 }
 
 # ============================================================
-#  SECTION 1 - ACTIONS SAFE (aucune incidence fonctionnelle)
+#  SECTION 1 - FONCTIONS SANS IMPACT PROD (SAFE)
+#  (regroupees par theme dans le menu, cf. Show-*Menu en fin de fichier)
 # ============================================================
 
 function Invoke-SafeEnableRecycleBin {
@@ -560,7 +632,7 @@ function Invoke-SafeEnableNtlmAudit {
     Write-Host "         jamais de blocage) afin d'identifier QUI utilise encore NTLMv1/LM avant de" -ForegroundColor DarkGray
     Write-Host "         forcer sa desactivation (action A VALIDER : Desactiver NTLMv1/LM)." -ForegroundColor DarkGray
     Write-Host "         Laissez tourner plusieurs jours (couvrant un cycle metier complet), puis" -ForegroundColor DarkGray
-    Write-Host "         consultez le rapport dedie dans le menu [3] Rapports." -ForegroundColor DarkGray
+    Write-Host "         consultez le rapport dedie dans le menu NTLM / LM (item 2)." -ForegroundColor DarkGray
 
     $dcs = Get-DomainControllersList
     if (-not $dcs) { return }
@@ -590,7 +662,7 @@ function Invoke-SafeEnableNtlmAudit {
     }
 
     Write-Log "Audit NTLM active (journalisation uniquement, aucun blocage applique)." -Level OK
-    Write-Log "Rappel : l'audit du logon (menu SAFE 'audit avance sur les DC') doit aussi etre actif pour que le rapport NTLMv1/LM (menu [3] Rapports) puisse remonter des resultats." -Level WARN
+    Write-Log "Rappel : l'audit du logon (menu Journalisation et detection > 2 'audit avance sur les DC') doit aussi etre actif pour que le rapport NTLMv1/LM (menu NTLM / LM > 2) puisse remonter des resultats." -Level WARN
 }
 
 function Invoke-SafeEnablePowerShellLogging {
@@ -641,6 +713,124 @@ function Invoke-SafeClearPasswordNotRequired {
             }
         }
     }
+}
+
+function Invoke-Audit11DefaultPasswordPolicy {
+    Write-Host "`n--- Audit de la politique de mot de passe par defaut du domaine ---" -ForegroundColor Magenta
+
+    try {
+        $policy = Get-ADDefaultDomainPasswordPolicy -ErrorAction Stop
+    } catch {
+        Write-Log ("Impossible de lire la politique de mot de passe : {0}" -f $_.Exception.Message) -Level ERROR
+        return
+    }
+
+    Write-Host ("Longueur minimale     : {0} (recommande >= 14)" -f $policy.MinPasswordLength) -ForegroundColor Yellow
+    Write-Host ("Complexite activee    : {0}" -f $policy.ComplexityEnabled) -ForegroundColor Yellow
+    Write-Host ("Historique conserve   : {0} (recommande >= 24)" -f $policy.PasswordHistoryCount) -ForegroundColor Yellow
+    Write-Host ("Age maximal (jours)   : {0}" -f $policy.MaxPasswordAge.Days) -ForegroundColor Yellow
+    Write-Host ("Seuil de verrouillage : {0} (recommande entre 5 et 10, jamais 0)" -f $policy.LockoutThreshold) -ForegroundColor Yellow
+    Write-Host ("Duree de verrouillage : {0}" -f $policy.LockoutDuration) -ForegroundColor Yellow
+
+    $issues = @()
+    if ($policy.MinPasswordLength -lt 14) { $issues += "Longueur minimale < 14" }
+    if (-not $policy.ComplexityEnabled) { $issues += "Complexite desactivee" }
+    if ($policy.PasswordHistoryCount -lt 24) { $issues += "Historique < 24" }
+    if ($policy.LockoutThreshold -eq 0) { $issues += "Verrouillage de compte DESACTIVE (LockoutThreshold=0)" }
+
+    if ($issues.Count -gt 0) {
+        Write-Log ("Points a corriger : {0}" -f ($issues -join ' ; ')) -Level WARN
+    } else {
+        Write-Log "Politique de mot de passe par defaut conforme aux recommandations de base." -Level OK
+    }
+}
+
+function Invoke-Remediate11HardenDefaultPasswordPolicy {
+    Write-Host "`n--- Corriger la politique de mot de passe par defaut du domaine ---" -ForegroundColor Red
+    Write-Host "Risque : un renforcement de la politique peut forcer un changement de mot de passe" -ForegroundColor DarkGray
+    Write-Host "         plus contraignant pour les utilisateurs, ou bloquer des mots de passe faibles" -ForegroundColor DarkGray
+    Write-Host "         historiques lors de leur prochain changement." -ForegroundColor DarkGray
+
+    $lengthInput = Read-Host "Longueur minimale du mot de passe [defaut 14]"
+    $length = if ($lengthInput -match '^\d+$') { [int]$lengthInput } else { 14 }
+    $historyInput = Read-Host "Nombre de mots de passe conserves dans l'historique [defaut 24]"
+    $history = if ($historyInput -match '^\d+$') { [int]$historyInput } else { 24 }
+    $lockoutInput = Read-Host "Seuil de verrouillage (tentatives echouees) [defaut 10]"
+    $lockout = if ($lockoutInput -match '^\d+$') { [int]$lockoutInput } else { 10 }
+
+    if (-not (Confirm-Action ("Appliquer : longueur min={0}, complexite=activee, historique={1}, verrouillage={2} tentatives" -f $length, $history, $lockout) -Strong)) { return }
+
+    Invoke-Guarded -Description "Mise a jour de la politique de mot de passe par defaut" -Action {
+        Set-ADDefaultDomainPasswordPolicy -Identity (Get-ADDomain).DistinguishedName -MinPasswordLength $length -ComplexityEnabled $true -PasswordHistoryCount $history -LockoutThreshold $lockout -LockoutDuration ([TimeSpan]::FromMinutes(15)) -LockoutObservationWindow ([TimeSpan]::FromMinutes(15))
+    }
+}
+
+function Invoke-Remediate11CreateServiceAccountFGPP {
+    Write-Host "`n--- Creer une Fine-Grained Password Policy pour les comptes de service ---" -ForegroundColor Red
+    Write-Host "S'applique UNIQUEMENT au groupe cible fourni (jamais a tout le domaine) - permet une" -ForegroundColor DarkGray
+    Write-Host "politique plus longue/sans expiration courte, adaptee aux comptes de service, sans" -ForegroundColor DarkGray
+    Write-Host "toucher la politique par defaut des comptes utilisateurs." -ForegroundColor DarkGray
+
+    $groupName = Read-Host "Groupe AD cible (comptes de service) - sera cree s'il n'existe pas"
+    if ([string]::IsNullOrWhiteSpace($groupName)) { Write-Log "Nom de groupe vide, action annulee." -Level WARN; return }
+
+    $lengthInput = Read-Host "Longueur minimale du mot de passe pour ce groupe [defaut 24]"
+    $length = if ($lengthInput -match '^\d+$') { [int]$lengthInput } else { 24 }
+
+    $policyName = "PSO-ComptesDeService"
+    if (-not (Confirm-Action ("Creer la FGPP '{0}' (longueur min {1}) et l'appliquer au groupe '{2}'" -f $policyName, $length, $groupName) -Strong)) { return }
+
+    Invoke-Guarded -Description ("Creation du groupe {0} (si absent)" -f $groupName) -Action {
+        if (-not (Get-ADGroup -Filter "Name -eq '$groupName'" -ErrorAction SilentlyContinue)) {
+            New-ADGroup -Name $groupName -GroupScope Global -GroupCategory Security -Description "Comptes de service - FGPP dediee (ADHC)"
+        }
+    }
+
+    Invoke-Guarded -Description ("Creation de la FGPP {0}" -f $policyName) -Action {
+        if (-not (Get-ADFineGrainedPasswordPolicy -Identity $policyName -ErrorAction SilentlyContinue)) {
+            New-ADFineGrainedPasswordPolicy -Name $policyName -Precedence 10 -MinPasswordLength $length -ComplexityEnabled $true -PasswordHistoryCount 24 -MaxPasswordAge ([TimeSpan]::FromDays(0)) -LockoutThreshold 0 -Description "FGPP comptes de service - deployee par le script de remediation AD"
+        }
+        Add-ADFineGrainedPasswordPolicySubject -Identity $policyName -Subjects $groupName
+    }
+    Write-Log ("FGPP '{0}' appliquee au groupe '{1}'. Ajoutez les comptes de service concernes a ce groupe." -f $policyName, $groupName) -Level OK
+}
+
+function Invoke-Remediate11GenerateMfaRecommendations {
+    Write-Host "`n--- Generer les recommandations MFA / Conditional Access (environnements hybrides) ---" -ForegroundColor Cyan
+    Write-Host "Impact : AUCUN. Ecrit uniquement un fichier de recommandations dans Logs\Procedures." -ForegroundColor DarkGray
+    Write-Host "La mise en oeuvre reelle (Entra ID / Conditional Access) est hors perimetre technique" -ForegroundColor DarkGray
+    Write-Host "de ce script (base PowerShell/AD on-premises)." -ForegroundColor DarkGray
+
+    if (-not (Confirm-Action "Generer le fichier de recommandations MFA/Conditional Access")) { return }
+
+    $content = @'
+RECOMMANDATIONS MFA ET CONDITIONAL ACCESS - ENVIRONNEMENTS HYBRIDES
+============================================================
+A mettre en oeuvre cote Microsoft Entra ID (hors perimetre technique de ce script) :
+
+1. Activer le MFA pour TOUS les comptes administrateurs cloud (Global Admin, Privileged Role
+   Admin...) au minimum, puis progressivement pour l'ensemble des utilisateurs.
+2. Deployer une politique d'acces conditionnel bloquant les authentifications "legacy" (Basic
+   Auth, protocoles ne supportant pas le MFA - IMAP, POP, SMTP AUTH anciens).
+3. Exiger le MFA pour tout acces depuis un reseau non approuve (hors plages IP du siege/VPN).
+4. Bloquer ou surveiller etroitement les connexions depuis des pays/regions non pertinents pour
+   l'activite de l'organisation.
+5. Exiger un appareil conforme (Intune) ou joint a Entra ID pour l'acces aux ressources sensibles.
+6. Prevoir des methodes de MFA resistantes au phishing (cle de securite FIDO2, Windows Hello for
+   Business) pour les comptes a privileges, plutot que SMS/appel telephonique.
+7. Revoir regulierement les exclusions de politique d'acces conditionnel (comptes de service
+   cloud, comptes de secours "break glass") : elles doivent rester minimales et documentees.
+8. Prevoir 2 comptes "break glass" (acces d'urgence) exclus du MFA courant, avec mot de passe
+   tres long, surveilles etroitement (alerte a la moindre connexion), conformement aux
+   recommandations Microsoft.
+'@
+
+    $dir = Join-Path $Script:LogDir "Procedures"
+    Invoke-Guarded -Description "Generation des recommandations MFA/Conditional Access" -Action {
+        New-Item -Path $dir -ItemType Directory -Force | Out-Null
+        Set-Content -Path (Join-Path $dir "Recommandations_MFA_ConditionalAccess.txt") -Value $content -Encoding UTF8
+    }
+    Write-Log ("Recommandations generees dans {0}." -f (Join-Path $dir "Recommandations_MFA_ConditionalAccess.txt")) -Level OK
 }
 
 function Invoke-SafeEnableWinRmViaGPO {
@@ -771,22 +961,9 @@ function Invoke-SafeEnableWinRmOnDCs {
     }
 }
 
-function Invoke-SafeAll {
-    Write-Host "`n=== Execution de toutes les actions SAFE ===" -ForegroundColor Cyan
-    if (-not (Confirm-Action "Lancer l'ensemble des actions SAFE listees ci-dessus, une par une")) { return }
-    Invoke-SafeEnableWinRmOnDCs
-    Invoke-SafeEnableRecycleBin
-    Invoke-SafeDisableGuest
-    Invoke-SafeProtectOUs
-    Invoke-SafeSetMachineAccountQuotaZero
-    Invoke-SafeEnableDCAuditPolicy
-    Invoke-SafeEnableNtlmAudit
-    Invoke-SafeEnablePowerShellLogging
-    Invoke-SafeClearPasswordNotRequired
-}
-
 # ============================================================
-#  SECTION 2 - ACTIONS A VALIDER (impact potentiel)
+#  SECTION 2 - FONCTIONS A IMPACT POTENTIEL
+#  (regroupees par theme dans le menu, cf. Show-*Menu en fin de fichier)
 # ============================================================
 
 function Invoke-RiskyResetKrbtgt {
@@ -1042,8 +1219,8 @@ function Invoke-RiskyDisableNtlmV1 {
     Write-Host "Recommandation : appliquer d'abord un niveau intermediaire (3) et surveiller les echecs," -ForegroundColor DarkGray
     Write-Host "         puis passer a 5 apres validation." -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "Avant de continuer : avez-vous active l'audit NTLM (menu SAFE) et consulte le rapport" -ForegroundColor Yellow
-    Write-Host "'NTLMv1/LM detecte' (menu [3] Rapports) pour identifier les comptes/postes concernes ?" -ForegroundColor Yellow
+    Write-Host "Avant de continuer : avez-vous active l'audit NTLM (menu NTLM / LM > 1) et consulte le" -ForegroundColor Yellow
+    Write-Host "rapport 'NTLMv1/LM detecte' (menu NTLM / LM > 2) pour identifier les comptes/postes concernes ?" -ForegroundColor Yellow
     if ((Read-Host "Continuer sans avoir verifie ce rapport est deconseille. Continuer quand meme ? (O/N)") -notmatch '^[oOyY]') { return }
 
     $level = Read-Host "Niveau LmCompatibilityLevel a appliquer (3=intermediaire recommande pour test, 5=NTLMv2 uniquement) [3/5]"
@@ -1064,6 +1241,40 @@ function Invoke-RiskyDisableNtlmV1 {
         Set-GPRegistryValue -Name $gpoName -Key "HKLM\System\CurrentControlSet\Control\Lsa" -ValueName "LmCompatibilityLevel" -Type DWord -Value ([int]$level)
         Write-Log "GPO creee mais NON liee automatiquement. Liez-la manuellement a un OU pilote avant deploiement large." -Level WARN
     }
+}
+
+function Invoke-Remediate6RestrictNtlmOutgoing {
+    Write-Host "`n--- Restriction progressive de NTLM sortant (Deny avec exceptions) ---" -ForegroundColor Red
+    Write-Host "Complementaire a la desactivation NTLMv1/LM : ce parametre bloque TOUTE authentification" -ForegroundColor DarkGray
+    Write-Host "NTLM sortante (v1 ET v2) depuis les DC, sauf vers les serveurs explicitement exceptes." -ForegroundColor DarkGray
+    Write-Host "Necessite l'audit NTLM actif depuis un moment (menu NTLM / LM > 1) pour batir la liste" -ForegroundColor DarkGray
+    Write-Host "d'exceptions a partir des usages reellement observes." -ForegroundColor DarkGray
+
+    if (-not (Get-Module -ListAvailable -Name GroupPolicy)) {
+        Write-Log "Le module GroupPolicy (RSAT-GPMC) n'est pas installe sur ce poste." -Level ERROR
+        return
+    }
+    Import-Module GroupPolicy -ErrorAction SilentlyContinue
+
+    $exceptions = Read-Host "Serveurs exceptes (NTLM autorise vers eux), noms separes par une virgule (vide = aucune exception)"
+    $exceptionList = @($exceptions -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+
+    $gpoName = "ADHC - Restriction NTLM sortant (Deny)"
+    if (-not (Confirm-Action ("Creer/lier la GPO '{0}' sur l'OU Domain Controllers (NTLM sortant refuse, {1} exception(s))" -f $gpoName, $exceptionList.Count) -Strong)) { return }
+
+    $ouDCs = "OU=Domain Controllers,$((Get-ADDomain).DistinguishedName)"
+    Invoke-Guarded -Description ("Creation/MAJ de la GPO {0}" -f $gpoName) -Action {
+        $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+        if (-not $gpo) { $gpo = New-GPO -Name $gpoName }
+        $key = "HKLM\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0"
+        # RestrictSendingNTLMTraffic = 2 -> "Deny All" (bloque tout NTLM sortant, sauf exceptions)
+        Set-GPRegistryValue -Name $gpoName -Key $key -ValueName "RestrictSendingNTLMTraffic" -Type DWord -Value 2
+        if ($exceptionList.Count -gt 0) {
+            Set-GPRegistryValue -Name $gpoName -Key $key -ValueName "ClientAllowedNTLMServers" -Type MultiString -Value $exceptionList
+        }
+        try { New-GPLink -Name $gpoName -Target $ouDCs -ErrorAction Stop | Out-Null } catch { }
+    }
+    Write-Log "GPO liee sur l'OU Domain Controllers. Verifiez le journal NTLM Operational (audit) pendant plusieurs jours apres application pour detecter des blocages inattendus." -Level WARN
 }
 
 function Invoke-RiskyDisableDesForceAes {
@@ -1093,6 +1304,122 @@ function Invoke-RiskyDisableDesForceAes {
             Set-ADUser -Identity $acc.DistinguishedName -Replace @{ "msDS-SupportedEncryptionTypes" = 24 }
         }
     }
+}
+
+function Invoke-Audit5AsRepRoasting {
+    Write-Host "`n--- Audit AS-REP Roasting (comptes sans pre-authentification Kerberos) ---" -ForegroundColor Magenta
+    Write-Host "Un compte avec 'Ne pas exiger de pre-authentification Kerberos' permet a un attaquant" -ForegroundColor DarkGray
+    Write-Host "de recuperer un paquet AS-REP chiffre avec le hash du mot de passe et de l'attaquer hors ligne." -ForegroundColor DarkGray
+
+    $accounts = @(Get-ADUser -Filter 'DoesNotRequirePreAuth -eq $true' -Properties DoesNotRequirePreAuth, Enabled, PasswordLastSet)
+    if ($accounts.Count -eq 0) { Write-Log "Aucun compte avec pre-authentification Kerberos desactivee." -Level OK; return }
+
+    Write-Host ("{0} compte(s) sans pre-authentification Kerberos :" -f $accounts.Count) -ForegroundColor Red
+    $accounts | ForEach-Object { Write-Host ("  - {0} (actif : {1})" -f $_.SamAccountName, $_.Enabled) }
+
+    $path = Join-Path $Script:LogDir ("Rapport_AsRepRoasting_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $accounts | Select-Object SamAccountName, Enabled, PasswordLastSet | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+    Write-Log ("Rapport exporte : {0}" -f $path) -Level OK
+}
+
+function Invoke-Remediate5FixAsRepRoasting {
+    Write-Host "`n--- Corriger l'exposition AS-REP Roasting ---" -ForegroundColor Red
+    Write-Host "Reactive la pre-authentification Kerberos sur les comptes selectionnes." -ForegroundColor DarkGray
+    Write-Host "Risque : si ce parametre etait positionne intentionnellement pour un usage specifique" -ForegroundColor DarkGray
+    Write-Host "         (rare), cet usage cessera de fonctionner." -ForegroundColor DarkGray
+
+    $accounts = @(Get-ADUser -Filter 'DoesNotRequirePreAuth -eq $true' -Properties DoesNotRequirePreAuth)
+    if ($accounts.Count -eq 0) { Write-Log "Aucun compte concerne." -Level OK; return }
+
+    $selected = @(Select-AccountsInteractive -Accounts $accounts -Prompt "Numeros des comptes a corriger, separes par une virgule ('tous' possible, vide = annuler)")
+    if ($selected.Count -eq 0) { return }
+
+    if (-not (Confirm-Action ("Reactiver la pre-authentification Kerberos sur {0} compte(s)" -f $selected.Count) -Strong)) { return }
+
+    foreach ($acc in $selected) {
+        Invoke-Guarded -Description ("Reactivation pre-authentification sur {0}" -f $acc.SamAccountName) -Action {
+            Set-ADAccountControl -Identity $acc.DistinguishedName -DoesNotRequirePreAuth $false
+        }
+    }
+}
+
+function Invoke-Audit5TrustsEncryption {
+    Write-Host "`n--- Audit des relations d'approbation (trusts) et de leur chiffrement ---" -ForegroundColor Magenta
+
+    try {
+        $trusts = @(Get-ADTrust -Filter * -Properties Direction, TrustType, ForestTransitive, SIDFilteringForestAware, SIDFilteringQuarantined, 'msDS-SupportedEncryptionTypes' -ErrorAction Stop)
+    } catch {
+        Write-Log ("Impossible de lire les relations d'approbation : {0}" -f $_.Exception.Message) -Level ERROR
+        return
+    }
+
+    if ($trusts.Count -eq 0) { Write-Log "Aucune relation d'approbation configuree sur ce domaine." -Level OK; return }
+
+    $rows = $trusts | ForEach-Object {
+        [PSCustomObject]@{
+            Domaine          = $_.Name
+            Direction        = $_.Direction
+            Type             = $_.TrustType
+            TransitiveForet  = $_.ForestTransitive
+            FiltrageSIDActif = ($_.SIDFilteringForestAware -or $_.SIDFilteringQuarantined)
+            Chiffrement      = Get-SupportedEncryptionTypesLabel -Value $_.'msDS-SupportedEncryptionTypes'
+        }
+    }
+
+    $rows | ForEach-Object {
+        $color = if (-not $_.FiltrageSIDActif) { 'Yellow' } else { 'Green' }
+        Write-Host ("  - {0} ({1}, {2}) : filtrage SID actif={3}, chiffrement={4}" -f $_.Domaine, $_.Direction, $_.Type, $_.FiltrageSIDActif, $_.Chiffrement) -ForegroundColor $color
+    }
+
+    $path = Join-Path $Script:LogDir ("Rapport_Trusts_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $rows | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+    Write-Log ("Rapport exporte : {0}. Un trust sans filtrage SID actif (hors relation intra-foret) est un vecteur d'elevation depuis le domaine approuve." -f $path) -Level OK
+}
+
+function Invoke-Remediate5EnableKerberosArmoring {
+    Write-Host "`n--- Activer Kerberos Armoring (FAST) ---" -ForegroundColor Red
+    Write-Host "Necessite un niveau fonctionnel de domaine/foret Windows Server 2012 minimum, et que" -ForegroundColor DarkGray
+    Write-Host "TOUS les DC du domaine soient a jour (sinon des postes peuvent echouer a s'authentifier)." -ForegroundColor DarkGray
+    Write-Host "Deploiement en 2 temps recommande : DC en mode 'Supported' d'abord, clients ensuite." -ForegroundColor DarkGray
+
+    if (-not (Get-Module -ListAvailable -Name GroupPolicy)) {
+        Write-Log "Le module GroupPolicy (RSAT-GPMC) n'est pas installe sur ce poste." -Level ERROR
+        return
+    }
+    Import-Module GroupPolicy -ErrorAction SilentlyContinue
+
+    try { $level = (Get-ADDomain).DomainMode } catch { $level = $null }
+    if ($level -and $level -match '2000|2003|2008') {
+        Write-Log ("Niveau fonctionnel de domaine actuel ({0}) probablement insuffisant pour Kerberos Armoring (2012 minimum recommande)." -f $level) -Level WARN
+    }
+
+    $ouDCs = "OU=Domain Controllers,$((Get-ADDomain).DistinguishedName)"
+    $targetOUs = @(Select-OUsInteractive -Label "les clients Kerberos Armoring" -Verb "CIBLER (en plus des DC)")
+
+    $gpoNameDc = "ADHC - Kerberos Armoring (DC)"
+    $gpoNameClient = "ADHC - Kerberos Armoring (Clients)"
+    if (-not (Confirm-Action ("Creer/lier '{0}' sur l'OU Domain Controllers, et '{1}' sur {2} UO client(s)" -f $gpoNameDc, $gpoNameClient, $targetOUs.Count) -Strong)) { return }
+
+    Invoke-Guarded -Description ("Creation/MAJ de la GPO {0}" -f $gpoNameDc) -Action {
+        $gpo = Get-GPO -Name $gpoNameDc -ErrorAction SilentlyContinue
+        if (-not $gpo) { $gpo = New-GPO -Name $gpoNameDc }
+        # 1 = Supported (le DC accepte le FAST sans l'exiger, etape recommandee avant "Required")
+        Set-GPRegistryValue -Name $gpoNameDc -Key "HKLM\SYSTEM\CurrentControlSet\Services\Kdc" -ValueName "EnableCbacAndArmor" -Type DWord -Value 1
+        try { New-GPLink -Name $gpoNameDc -Target $ouDCs -ErrorAction Stop | Out-Null } catch { }
+    }
+
+    if ($targetOUs.Count -gt 0) {
+        Invoke-Guarded -Description ("Creation/MAJ de la GPO {0}" -f $gpoNameClient) -Action {
+            $gpo = Get-GPO -Name $gpoNameClient -ErrorAction SilentlyContinue
+            if (-not $gpo) { $gpo = New-GPO -Name $gpoNameClient }
+            # 1 = Supported cote client egalement
+            Set-GPRegistryValue -Name $gpoNameClient -Key "HKLM\SOFTWARE\Policies\Microsoft\Windows\Kerberos\Parameters" -ValueName "EnableCbacAndArmor" -Type DWord -Value 1
+            foreach ($ou in $targetOUs) {
+                try { New-GPLink -Name $gpoNameClient -Target $ou -ErrorAction Stop | Out-Null } catch { }
+            }
+        }
+    }
+    Write-Log "Kerberos Armoring active en mode 'Supported'. Repassez en mode 'Required' uniquement apres validation que tous les clients concernes le supportent." -Level OK
 }
 
 function Invoke-RiskySetPrivilegedNotDelegated {
@@ -1280,6 +1607,124 @@ function Invoke-RiskyDisableSpoolerOnDCs {
             } -ErrorAction Stop
         }
     }
+}
+
+function Invoke-Audit9TimeSyncStatus {
+    Write-Host "`n--- Etat de la synchronisation horaire (NTP) sur les DC ---" -ForegroundColor Magenta
+    Write-Host "Le PDC Emulator du domaine racine de la foret doit se synchroniser sur une source" -ForegroundColor DarkGray
+    Write-Host "externe fiable ; les autres DC se synchronisent normalement sur la hierarchie du domaine." -ForegroundColor DarkGray
+
+    $dcs = Get-DomainControllersList
+    if (-not $dcs) { return }
+    $wr = Test-DCWinRmConnectivity -ComputerNames $dcs.HostName
+    $dcs = @($dcs | Where-Object { $wr.Reachable -contains $_.HostName })
+    if (-not $dcs) { Write-Log "Aucun DC joignable via PowerShell Remoting (WinRM), action annulee." -Level ERROR; return }
+
+    $pdc = (Get-ADDomain).PDCEmulator
+
+    foreach ($dc in $dcs) {
+        try {
+            $source = Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+                (& w32tm.exe /query /source 2>&1 | Out-String).Trim()
+            } -ErrorAction Stop
+            $isPdc = $dc.HostName -eq $pdc
+            $label = if ($isPdc) { " (PDC Emulator)" } else { "" }
+            Write-Host ("  - {0}{1} : source = {2}" -f $dc.HostName, $label, $source) -ForegroundColor Yellow
+            if ($isPdc -and $source -match 'Local CMOS Clock') {
+                Write-Log ("Le PDC Emulator {0} se synchronise sur son horloge locale (aucune source externe) : a corriger en priorite." -f $dc.HostName) -Level WARN
+            }
+        } catch {
+            Write-Log ("Impossible d'interroger w32tm sur {0} : {1}" -f $dc.HostName, $_.Exception.Message) -Level WARN
+        }
+    }
+}
+
+function Invoke-Remediate9ConfigurePdcTimeSource {
+    Write-Host "`n--- Configurer la source NTP externe du PDC Emulator ---" -ForegroundColor Red
+    Write-Host "S'applique uniquement au PDC Emulator (les autres DC se synchronisent sur la hierarchie" -ForegroundColor DarkGray
+    Write-Host "du domaine par defaut, ce qui est correct et ne doit pas etre modifie)." -ForegroundColor DarkGray
+
+    $pdc = (Get-ADDomain).PDCEmulator
+    $ntpServers = Read-Host "Serveurs NTP externes (separes par une virgule) [defaut pool.ntp.org]"
+    if ([string]::IsNullOrWhiteSpace($ntpServers)) { $ntpServers = "pool.ntp.org" }
+    $peerList = ($ntpServers -split ',' | ForEach-Object { $_.Trim() }) -join ' '
+
+    if (-not (Confirm-Action ("Configurer {0} (PDC Emulator) pour se synchroniser sur : {1}" -f $pdc, $peerList) -Strong)) { return }
+
+    Invoke-Guarded -Description ("Configuration NTP sur {0}" -f $pdc) -Action {
+        Invoke-Command -ComputerName $pdc -ScriptBlock {
+            param($peers)
+            & w32tm.exe /config /manualpeerlist:"$peers" /syncfromflags:manual /reliable:yes /update | Out-Null
+            Restart-Service w32time -Force
+        } -ArgumentList $peerList -ErrorAction Stop
+    }
+    Write-Log "Configuration appliquee. Verifiez apres quelques minutes avec 'w32tm /query /status' sur le PDC." -Level OK
+}
+
+function Invoke-Audit9InstalledRoles {
+    Write-Host "`n--- Roles et fonctionnalites installes sur les DC ---" -ForegroundColor Magenta
+    Write-Host "Lecture seule : signale les roles/fonctionnalites installes en plus du socle DC standard" -ForegroundColor DarkGray
+    Write-Host "(AD DS, DNS, outils de gestion). A revoir au cas par cas - certains ajouts sont legitimes." -ForegroundColor DarkGray
+
+    $dcs = Get-DomainControllersList
+    if (-not $dcs) { return }
+    $wr = Test-DCWinRmConnectivity -ComputerNames $dcs.HostName
+    $dcs = @($dcs | Where-Object { $wr.Reachable -contains $_.HostName })
+    if (-not $dcs) { Write-Log "Aucun DC joignable via PowerShell Remoting (WinRM), action annulee." -Level ERROR; return }
+
+    $expected = @('AD-Domain-Services','DNS','RSAT-AD-Tools','RSAT-DNS-Server','GPMC','FS-FileServer')
+    $rows = foreach ($dc in $dcs) {
+        try {
+            Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+                param($expectedList)
+                Get-WindowsFeature | Where-Object { $_.InstallState -eq 'Installed' -and $_.Name -notin $expectedList } |
+                    Select-Object @{N='DC';E={$env:COMPUTERNAME}}, Name, DisplayName
+            } -ArgumentList (,$expected) -ErrorAction Stop
+        } catch {
+            Write-Log ("Impossible de lire les roles installes sur {0} : {1}" -f $dc.HostName, $_.Exception.Message) -Level WARN
+        }
+    }
+
+    $rows = @($rows)
+    if ($rows.Count -eq 0) { Write-Log "Aucun role/fonctionnalite hors du socle DC standard detecte." -Level OK; return }
+
+    $rows | ForEach-Object { Write-Host ("  - {0} : {1}" -f $_.DC, $_.DisplayName) -ForegroundColor Yellow }
+
+    $path = Join-Path $Script:LogDir ("Rapport_RolesInstalles_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $rows | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+    Write-Log ("Rapport exporte : {0}. La liste des roles 'attendus' est indicative - ajustez-la selon votre contexte." -f $path) -Level OK
+}
+
+function Invoke-Remediate9EnableFirewallBaseline {
+    Write-Host "`n--- Activer le pare-feu Windows (3 profils) sur les DC via GPO ---" -ForegroundColor Red
+    Write-Host "Risque : si des flux legitimes ne sont pas couverts par les regles predefinies actives" -ForegroundColor DarkGray
+    Write-Host "         (ou par vos regles personnalisees), ils seront bloques. Testez en OU pilote." -ForegroundColor DarkGray
+    Write-Host "Rappel (restriction Internet) : la restriction d'acces Internet des DC releve normalement" -ForegroundColor DarkGray
+    Write-Host "du pare-feu perimetrique/proxy (pas du pare-feu Windows local) - un blocage sortant local" -ForegroundColor DarkGray
+    Write-Host "mal cible casse souvent Windows Update, la verification de revocation de certificats (CRL/" -ForegroundColor DarkGray
+    Write-Host "OCSP) ou la synchronisation horaire externe ; non automatise ici pour cette raison." -ForegroundColor DarkGray
+
+    if (-not (Get-Module -ListAvailable -Name GroupPolicy)) {
+        Write-Log "Le module GroupPolicy (RSAT-GPMC) n'est pas installe sur ce poste." -Level ERROR
+        return
+    }
+    Import-Module GroupPolicy -ErrorAction SilentlyContinue
+
+    $gpoName = "ADHC - Pare-feu Windows actif (DC)"
+    if (-not (Confirm-Action ("Creer/lier la GPO '{0}' sur l'OU Domain Controllers (pare-feu actif, 3 profils)" -f $gpoName) -Strong)) { return }
+
+    $ouDCs = "OU=Domain Controllers,$((Get-ADDomain).DistinguishedName)"
+    Invoke-Guarded -Description ("Creation/MAJ de la GPO {0}" -f $gpoName) -Action {
+        $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+        if (-not $gpo) { $gpo = New-GPO -Name $gpoName }
+        foreach ($fwProfile in @('DomainProfile','PrivateProfile','PublicProfile')) {
+            $key = "HKLM\SOFTWARE\Policies\Microsoft\WindowsFirewall\$fwProfile"
+            Set-GPRegistryValue -Name $gpoName -Key $key -ValueName "EnableFirewall" -Type DWord -Value 1
+            Set-GPRegistryValue -Name $gpoName -Key $key -ValueName "DefaultInboundAction" -Type DWord -Value 1
+        }
+        try { New-GPLink -Name $gpoName -Target $ouDCs -ErrorAction Stop | Out-Null } catch { }
+    }
+    Write-Log "GPO liee sur l'OU Domain Controllers. Verifiez que les regles predefinies necessaires (AD DS, DNS, DFSR, Netlogon...) sont actives avant un redemarrage des DC." -Level WARN
 }
 
 function Invoke-RiskyEnforceLdapSigning {
@@ -1529,7 +1974,2170 @@ function Invoke-RiskyForcePasswordExpirationPrivileged {
 }
 
 # ============================================================
-#  SECTION 3 - RAPPORTS (lecture seule, aucune modification)
+#  SECTION - COMPTES A PRIVILEGES - COMPLEMENT (theme "Comptes a privileges")
+#  Limitation du nombre de Domain Admins, usage du compte Administrateur integre,
+#  comptes non nominatifs, risque Kerberoasting, restriction a des postes dedies (PAW).
+# ============================================================
+
+function Invoke-Audit3DomainAdminsCount {
+    Write-Host "`n--- Nombre de membres Domain Admins / Enterprise Admins ---" -ForegroundColor Magenta
+    Write-Host "Recommandation generale : limiter au strict necessaire (quelques comptes nominatifs)." -ForegroundColor DarkGray
+    Write-Host "Aucun seuil universel n'existe - ajustez selon la taille de l'organisation." -ForegroundColor DarkGray
+
+    $thresholdInput = Read-Host "Seuil d'alerte pour Domain Admins [defaut 5]"
+    $threshold = if ($thresholdInput -match '^\d+$') { [int]$thresholdInput } else { 5 }
+
+    $da = @(Get-ADGroupMember -Identity "Domain Admins" -Recursive -ErrorAction SilentlyContinue)
+    $ea = @(Get-ADGroupMember -Identity "Enterprise Admins" -Recursive -ErrorAction SilentlyContinue)
+
+    $colorDa = if ($da.Count -gt $threshold) { 'Red' } else { 'Green' }
+    Write-Host ("Domain Admins : {0} membre(s) (seuil {1})" -f $da.Count, $threshold) -ForegroundColor $colorDa
+    $da | ForEach-Object { Write-Host ("  - {0}" -f $_.SamAccountName) }
+    Write-Host ("Enterprise Admins : {0} membre(s)" -f $ea.Count) -ForegroundColor Yellow
+    $ea | ForEach-Object { Write-Host ("  - {0}" -f $_.SamAccountName) }
+
+    if ($da.Count -gt $threshold) {
+        Write-Log ("Domain Admins depasse le seuil ({0} > {1}) : revoyez si chaque membre a reellement besoin de ce privilege en permanence." -f $da.Count, $threshold) -Level WARN
+    }
+
+    $path = Join-Path $Script:LogDir ("Rapport_DomainAdmins_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    @($da | Select-Object SamAccountName, @{N='Groupe';E={'Domain Admins'}}) + @($ea | Select-Object SamAccountName, @{N='Groupe';E={'Enterprise Admins'}}) |
+        Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+    Write-Log ("Rapport exporte : {0}" -f $path) -Level OK
+}
+
+function Invoke-Audit3BuiltinAdministratorStatus {
+    Write-Host "`n--- Usage du compte Administrateur integre (RID 500) ---" -ForegroundColor Magenta
+    Write-Host "Bonne pratique : ce compte ne doit pas etre utilise au quotidien (comptes nominatifs" -ForegroundColor DarkGray
+    Write-Host "dedies a la place), et peut etre desactive s'il existe d'autres comptes Domain Admins actifs." -ForegroundColor DarkGray
+
+    try {
+        $domainSid = (Get-ADDomain).DomainSID.Value
+        $builtinAdmin = Get-ADUser -Identity "$domainSid-500" -Properties Enabled, LastLogonDate, PasswordLastSet -ErrorAction Stop
+    } catch {
+        Write-Log ("Impossible de lire le compte Administrateur integre : {0}" -f $_.Exception.Message) -Level ERROR
+        return
+    }
+
+    Write-Host ("Compte : {0}" -f $builtinAdmin.SamAccountName) -ForegroundColor Yellow
+    Write-Host ("  Actif                  : {0}" -f $builtinAdmin.Enabled)
+    Write-Host ("  Derniere connexion     : {0}" -f $builtinAdmin.LastLogonDate)
+    Write-Host ("  Dernier changement mdp : {0}" -f $builtinAdmin.PasswordLastSet)
+
+    if ($builtinAdmin.Enabled) {
+        if ($builtinAdmin.LastLogonDate -and $builtinAdmin.LastLogonDate -gt (Get-Date).AddDays(-30)) {
+            Write-Log "Le compte Administrateur integre est ACTIF et a ete utilise dans les 30 derniers jours : signe d'un usage au quotidien a corriger." -Level WARN
+        } else {
+            Write-Log "Le compte Administrateur integre est actif mais ne semble pas utilise recemment. Envisagez de le desactiver (voir remediation dediee)." -Level WARN
+        }
+    } else {
+        Write-Log "Le compte Administrateur integre est deja desactive." -Level OK
+    }
+}
+
+function Invoke-Remediate3DisableBuiltinAdministrator {
+    Write-Host "`n--- Desactiver le compte Administrateur integre (RID 500) ---" -ForegroundColor Red
+    Write-Host "Garde-fou : refuse de continuer si aucun AUTRE compte Domain Admins actif n'existe," -ForegroundColor DarkGray
+    Write-Host "pour ne jamais se retrouver sans aucun moyen d'administration du domaine." -ForegroundColor DarkGray
+
+    try {
+        $domainSid = (Get-ADDomain).DomainSID.Value
+        $builtinAdmin = Get-ADUser -Identity "$domainSid-500" -Properties Enabled -ErrorAction Stop
+    } catch {
+        Write-Log ("Impossible de lire le compte Administrateur integre : {0}" -f $_.Exception.Message) -Level ERROR
+        return
+    }
+
+    if (-not $builtinAdmin.Enabled) { Write-Log "Le compte Administrateur integre est deja desactive." -Level OK; return }
+
+    $otherActiveDA = @(Get-ADGroupMember -Identity "Domain Admins" -Recursive -ErrorAction SilentlyContinue |
+        Where-Object { $_.SID.Value -ne $builtinAdmin.SID.Value } |
+        ForEach-Object { Get-ADUser -Identity $_.SID -Properties Enabled -ErrorAction SilentlyContinue } |
+        Where-Object { $_.Enabled })
+
+    if ($otherActiveDA.Count -eq 0) {
+        Write-Log "Aucun AUTRE compte Domain Admins actif trouve : desactivation du compte integre REFUSEE (risque de perte totale d'acces administratif)." -Level ERROR
+        return
+    }
+
+    Write-Host ("{0} autre(s) compte(s) Domain Admins actif(s) confirme(s) :" -f $otherActiveDA.Count) -ForegroundColor Yellow
+    $otherActiveDA | ForEach-Object { Write-Host ("  - {0}" -f $_.SamAccountName) }
+
+    if (-not (Confirm-Action "Desactiver le compte Administrateur integre (RID 500)" -Strong)) { return }
+
+    Invoke-Guarded -Description "Desactivation du compte Administrateur integre" -Action {
+        Disable-ADAccount -Identity $builtinAdmin.DistinguishedName
+    }
+}
+
+function Invoke-Audit3NonNominativeAccounts {
+    Write-Host "`n--- Comptes a privileges potentiellement non nominatifs/partages ---" -ForegroundColor Magenta
+    Write-Host "Heuristique : compte a privileges sans Prenom/Nom renseigne, ou dont le nom correspond" -ForegroundColor DarkGray
+    Write-Host "a un motif generique (admin, administrateur, root, service...). A valider au cas par cas :" -ForegroundColor DarkGray
+    Write-Host "un compte nominatif prefixe (ex : adm-jdupont) est une bonne pratique, pas une anomalie." -ForegroundColor DarkGray
+
+    $groups = @("Domain Admins","Enterprise Admins","Schema Admins","Administrators")
+    $accounts = foreach ($g in $groups) {
+        try { Get-ADGroupMember -Identity $g -Recursive -ErrorAction Stop | Where-Object { $_.objectClass -eq 'user' } } catch { }
+    }
+    $accounts = @($accounts | Sort-Object -Property SID -Unique | ForEach-Object { Get-ADUser -Identity $_.SID -Properties GivenName, Surname, Description })
+
+    $genericPatterns = @('admin','administrateur','administrator','root','service','support','helpdesk','test')
+    $suspects = @($accounts | Where-Object {
+        $acc = $_
+        $noName = [string]::IsNullOrWhiteSpace($acc.GivenName) -and [string]::IsNullOrWhiteSpace($acc.Surname)
+        $genericName = $false
+        foreach ($p in $genericPatterns) { if ($acc.SamAccountName -like "*$p*") { $genericName = $true; break } }
+        $noName -or $genericName
+    })
+
+    if ($suspects.Count -eq 0) { Write-Log "Aucun compte a privileges suspect (heuristique nom generique/sans Prenom-Nom)." -Level OK; return }
+
+    Write-Host ("{0} compte(s) a valider :" -f $suspects.Count) -ForegroundColor Yellow
+    $suspects | ForEach-Object { Write-Host ("  - {0} (Prenom/Nom : '{1} {2}')" -f $_.SamAccountName, $_.GivenName, $_.Surname) }
+
+    $path = Join-Path $Script:LogDir ("Rapport_ComptesNonNominatifs_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $suspects | Select-Object SamAccountName, GivenName, Surname, Description | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+    Write-Log ("Rapport exporte : {0}" -f $path) -Level OK
+}
+
+function Invoke-Audit3KerberoastingRisk {
+    Write-Host "`n--- Risque Kerberoasting sur les comptes a privileges ---" -ForegroundColor Magenta
+    Write-Host "Comptes membres d'un groupe a privileges ET porteurs d'un SPN : cible ideale pour du" -ForegroundColor DarkGray
+    Write-Host "Kerberoasting (le TGS peut etre demande par n'importe quel compte authentifie puis" -ForegroundColor DarkGray
+    Write-Host "attaque hors ligne si le chiffrement est faible)." -ForegroundColor DarkGray
+
+    $privilegedSids = Get-ExpandedGroupMemberSids -GroupNames @("Domain Admins","Enterprise Admins","Schema Admins","Administrators","Account Operators","Backup Operators","Server Operators","Print Operators")
+    $spnAccounts = @(Get-ADUser -LDAPFilter "(servicePrincipalName=*)" -Properties ServicePrincipalName, 'msDS-SupportedEncryptionTypes')
+    $atRisk = @($spnAccounts | Where-Object { $privilegedSids.Contains($_.SID.Value) })
+
+    if ($atRisk.Count -eq 0) { Write-Log "Aucun compte a privileges porteur d'un SPN detecte." -Level OK; return }
+
+    Write-Host ("{0} compte(s) a privileges avec SPN (cible Kerberoasting) :" -f $atRisk.Count) -ForegroundColor Red
+    $atRisk | ForEach-Object { Write-Host ("  - {0} (chiffrement : {1})" -f $_.SamAccountName, (Get-SupportedEncryptionTypesLabel -Value $_.'msDS-SupportedEncryptionTypes')) }
+
+    $path = Join-Path $Script:LogDir ("Rapport_KerberoastingRisk_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $atRisk | Select-Object SamAccountName, @{N='SPN';E={$_.ServicePrincipalName -join ' | '}}, @{N='Chiffrement';E={ Get-SupportedEncryptionTypesLabel -Value $_.'msDS-SupportedEncryptionTypes' }} |
+        Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+    Write-Log ("Rapport exporte : {0}. Ces comptes devraient etre non-delegables et sans SPN si possible, ou migres en gMSA/Protected Users." -f $path) -Level OK
+}
+
+function Invoke-Remediate3RestrictPrivilegedLogonWorkstations {
+    Write-Host "`n--- Restreindre les comptes a privileges a des postes d'administration dedies (PAW) ---" -ForegroundColor Red
+    Write-Host "Positionne l'attribut 'Log on to' (LogonWorkstations) : le compte selectionne ne pourra" -ForegroundColor DarkGray
+    Write-Host "plus ouvrir de session que sur les machines listees. Risque : verrouillage du compte hors" -ForegroundColor DarkGray
+    Write-Host "de ces machines - gardez toujours un moyen d'acces de secours (autre compte, console DC)." -ForegroundColor DarkGray
+
+    $groups = @("Domain Admins","Enterprise Admins")
+    $accounts = foreach ($g in $groups) {
+        try { Get-ADGroupMember -Identity $g -Recursive -ErrorAction Stop | Where-Object { $_.objectClass -eq 'user' } } catch { }
+    }
+    $accounts = @($accounts | Sort-Object -Property SID -Unique | ForEach-Object { Get-ADUser -Identity $_.SID -Properties LogonWorkstations })
+    if ($accounts.Count -eq 0) { Write-Log "Aucun compte Domain/Enterprise Admins trouve." -Level OK; return }
+
+    $selected = @(Select-AccountsInteractive -Accounts $accounts -Prompt "Numeros des comptes a restreindre, separes par une virgule (vide = annuler)")
+    if ($selected.Count -eq 0) { return }
+
+    $workstations = Read-Host "Noms NetBIOS des postes d'administration dedies autorises, separes par une virgule (ex : PAW01,PAW02)"
+    if ([string]::IsNullOrWhiteSpace($workstations)) { Write-Log "Aucun poste fourni, action annulee." -Level WARN; return }
+    $wsList = ($workstations -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ','
+
+    if (-not (Confirm-Action ("Restreindre {0} compte(s) aux postes : {1}" -f $selected.Count, $wsList) -Strong)) { return }
+
+    foreach ($acc in $selected) {
+        Invoke-Guarded -Description ("Restriction de connexion de {0} aux postes {1}" -f $acc.SamAccountName, $wsList) -Action {
+            Set-ADUser -Identity $acc.DistinguishedName -LogonWorkstations $wsList
+        }
+    }
+}
+
+# ============================================================
+#  SECTION - SMB, SYSVOL ET NETLOGON (theme "SMB, SYSVOL et NETLOGON" du menu)
+#  Detection/desactivation SMBv1, signature SMB, durcissement des chemins UNC
+#  SYSVOL/NETLOGON (Hardened UNC Paths, MS15-011).
+# ============================================================
+
+function Invoke-Audit7Smb1Usage {
+    Write-Host "`n--- Detection de l'usage SMBv1 ---" -ForegroundColor Magenta
+    Write-Host "Propose d'activer l'audit SMBv1 (journalisation uniquement, jamais de blocage) sur les" -ForegroundColor DarkGray
+    Write-Host "DC joignables, puis lit le journal Microsoft-Windows-SMBServer/Audit pour lister les" -ForegroundColor DarkGray
+    Write-Host "clients qui se sont connectes en SMBv1 depuis l'activation de l'audit." -ForegroundColor DarkGray
+
+    $dcs = Get-DomainControllersList
+    if (-not $dcs) { return }
+    $wr = Test-DCWinRmConnectivity -ComputerNames $dcs.HostName
+    $dcs = @($dcs | Where-Object { $wr.Reachable -contains $_.HostName })
+    if (-not $dcs) { Write-Log "Aucun DC joignable via PowerShell Remoting (WinRM), action annulee." -Level ERROR; return }
+
+    if ((Read-Host "Activer/verifier l'audit SMBv1 sur ces DC avant lecture du journal ? (O/N)") -match '^[oOyY]') {
+        foreach ($dc in $dcs) {
+            Invoke-Guarded -Description ("Activation de l'audit SMBv1 sur {0}" -f $dc.HostName) -Action {
+                Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+                    Set-SmbServerConfiguration -AuditSmb1Access $true -Confirm:$false
+                } -ErrorAction Stop
+            }
+        }
+    }
+
+    $allRows = @()
+    foreach ($dc in $dcs) {
+        try {
+            $rows = Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+                try {
+                    Get-WinEvent -LogName "Microsoft-Windows-SMBServer/Audit" -ErrorAction Stop |
+                        Where-Object { $_.Id -eq 3000 } |
+                        ForEach-Object {
+                            [PSCustomObject]@{
+                                DC          = $env:COMPUTERNAME
+                                TimeCreated = $_.TimeCreated
+                                Message     = $_.Message
+                            }
+                        }
+                } catch { @() }
+            } -ErrorAction Stop
+            $allRows += @($rows)
+        } catch {
+            Write-Log ("Impossible de lire le journal SMBServer/Audit sur {0} : {1}" -f $dc.HostName, $_.Exception.Message) -Level WARN
+        }
+    }
+
+    $allRows = @($allRows)
+    if ($allRows.Count -eq 0) {
+        Write-Log "Aucune connexion SMBv1 detectee (ou audit non actif depuis assez longtemps)." -Level OK
+        return
+    }
+
+    $path = Join-Path $Script:LogDir ("Rapport_SMB1_Usage_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $allRows | Sort-Object TimeCreated -Descending | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+    Write-Host ("{0} connexion(s) SMBv1 detectee(s)." -f $allRows.Count) -ForegroundColor Yellow
+    Write-Log ("Rapport exporte : {0}. Identifiez les postes/equipements concernes AVANT de desactiver SMBv1." -f $path) -Level OK
+}
+
+function Invoke-Audit7SmbSigningStatus {
+    Write-Host "`n--- Etat de la signature SMB (client/serveur) sur les DC ---" -ForegroundColor Magenta
+
+    $dcs = Get-DomainControllersList
+    if (-not $dcs) { return }
+    $wr = Test-DCWinRmConnectivity -ComputerNames $dcs.HostName
+    $dcs = @($dcs | Where-Object { $wr.Reachable -contains $_.HostName })
+    if (-not $dcs) { Write-Log "Aucun DC joignable via PowerShell Remoting (WinRM), action annulee." -Level ERROR; return }
+
+    $rows = foreach ($dc in $dcs) {
+        try {
+            Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+                $srv = Get-SmbServerConfiguration
+                $cli = Get-SmbClientConfiguration
+                [PSCustomObject]@{
+                    DC                      = $env:COMPUTERNAME
+                    ServeurSignatureRequise = $srv.RequireSecuritySignature
+                    ServeurSignatureActivee = $srv.EnableSecuritySignature
+                    ClientSignatureRequise  = $cli.RequireSecuritySignature
+                    ClientSignatureActivee  = $cli.EnableSecuritySignature
+                    SMB1Actif               = $srv.EnableSMB1Protocol
+                }
+            } -ErrorAction Stop
+        } catch {
+            Write-Log ("Impossible de lire la configuration SMB de {0} : {1}" -f $dc.HostName, $_.Exception.Message) -Level WARN
+        }
+    }
+
+    $rows = @($rows)
+    $rows | ForEach-Object { Write-Host ("  - {0} : signature serveur requise={1}, SMBv1 actif={2}" -f $_.DC, $_.ServeurSignatureRequise, $_.SMB1Actif) -ForegroundColor Yellow }
+
+    $path = Join-Path $Script:LogDir ("Rapport_SMB_Signing_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $rows | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+    Write-Log ("Rapport exporte : {0}" -f $path) -Level OK
+}
+
+function Invoke-Remediate7DisableSmb1 {
+    Write-Host "`n--- Desactivation de SMBv1 (client et serveur) sur les DC ---" -ForegroundColor Red
+    Write-Host "Risque : casse l'acces des vieux NAS/scanners/imprimantes/applications qui ne parlent" -ForegroundColor DarkGray
+    Write-Host "         QUE SMBv1. Consultez le rapport d'usage SMBv1 avant de continuer." -ForegroundColor DarkGray
+    if ((Read-Host "Continuer sans avoir consulte le rapport d'usage SMBv1 est deconseille. Continuer ? (O/N)") -notmatch '^[oOyY]') { return }
+
+    $dcs = Get-DomainControllersList
+    if (-not $dcs) { return }
+    $wr = Test-DCWinRmConnectivity -ComputerNames $dcs.HostName
+    $dcs = @($dcs | Where-Object { $wr.Reachable -contains $_.HostName })
+    if (-not $dcs) { Write-Log "Aucun DC joignable via PowerShell Remoting (WinRM), action annulee." -Level ERROR; return }
+
+    if (-not (Confirm-Action "Desactiver SMBv1 (client + serveur) sur tous les DC listes" -Strong)) { return }
+
+    foreach ($dc in $dcs) {
+        Invoke-Guarded -Description ("Desactivation SMBv1 sur {0}" -f $dc.HostName) -Action {
+            Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+                Set-SmbServerConfiguration -EnableSMB1Protocol $false -Confirm:$false
+                Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart -ErrorAction SilentlyContinue | Out-Null
+            } -ErrorAction Stop
+        }
+    }
+    Write-Log "SMBv1 desactive. Un redemarrage peut etre necessaire pour retirer completement la fonctionnalite optionnelle." -Level WARN
+}
+
+function Invoke-Remediate7EnforceSmbSigning {
+    Write-Host "`n--- Forcer la signature SMB (client et serveur) via GPO ---" -ForegroundColor Red
+    Write-Host "Risque : casse les clients/serveurs SMB tres anciens ne supportant pas la signature" -ForegroundColor DarkGray
+    Write-Host "         (rare, mais possible sur des NAS/appliances obsoletes)." -ForegroundColor DarkGray
+
+    if (-not (Get-Module -ListAvailable -Name GroupPolicy)) {
+        Write-Log "Le module GroupPolicy (RSAT-GPMC) n'est pas installe sur ce poste." -Level ERROR
+        return
+    }
+    Import-Module GroupPolicy -ErrorAction SilentlyContinue
+
+    $gpoName = "ADHC - Signature SMB obligatoire"
+    if (-not (Confirm-Action ("Creer/lier la GPO '{0}' sur l'OU Domain Controllers (signature client+serveur obligatoire)" -f $gpoName) -Strong)) { return }
+
+    $ouDCs = "OU=Domain Controllers,$((Get-ADDomain).DistinguishedName)"
+    Invoke-Guarded -Description ("Creation/MAJ de la GPO {0}" -f $gpoName) -Action {
+        $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+        if (-not $gpo) { $gpo = New-GPO -Name $gpoName }
+        Set-GPRegistryValue -Name $gpoName -Key "HKLM\System\CurrentControlSet\Services\LanmanServer\Parameters" -ValueName "RequireSecuritySignature" -Type DWord -Value 1
+        Set-GPRegistryValue -Name $gpoName -Key "HKLM\System\CurrentControlSet\Services\LanmanServer\Parameters" -ValueName "EnableSecuritySignature" -Type DWord -Value 1
+        Set-GPRegistryValue -Name $gpoName -Key "HKLM\System\CurrentControlSet\Services\LanmanWorkstation\Parameters" -ValueName "RequireSecuritySignature" -Type DWord -Value 1
+        Set-GPRegistryValue -Name $gpoName -Key "HKLM\System\CurrentControlSet\Services\LanmanWorkstation\Parameters" -ValueName "EnableSecuritySignature" -Type DWord -Value 1
+        try { New-GPLink -Name $gpoName -Target $ouDCs -ErrorAction Stop | Out-Null } catch { }
+    }
+    Write-Log "GPO liee sur l'OU Domain Controllers uniquement. Etendez-la aux serveurs/postes apres validation sur un OU pilote." -Level WARN
+}
+
+function Invoke-Remediate7HardenedUncPaths {
+    Write-Host "`n--- Durcissement des chemins UNC SYSVOL et NETLOGON (Hardened UNC Paths) ---" -ForegroundColor Red
+    Write-Host "Exige l'integrite et l'authentification mutuelle sur les acces \\*\SYSVOL et \\*\NETLOGON." -ForegroundColor DarkGray
+    Write-Host "Impact large (tous les postes/serveurs qui lisent SYSVOL/NETLOGON, donc tout le domaine)." -ForegroundColor DarkGray
+    Write-Host "Risque residuel tres faible sur un parc a jour (recommandation Microsoft standard, MS15-011)." -ForegroundColor DarkGray
+
+    if (-not (Get-Module -ListAvailable -Name GroupPolicy)) {
+        Write-Log "Le module GroupPolicy (RSAT-GPMC) n'est pas installe sur ce poste." -Level ERROR
+        return
+    }
+    Import-Module GroupPolicy -ErrorAction SilentlyContinue
+
+    $gpoName = "ADHC - Hardened UNC Paths (SYSVOL-NETLOGON)"
+    if (-not (Confirm-Action ("Creer la GPO '{0}' (non liee automatiquement)" -f $gpoName) -Strong)) { return }
+
+    Invoke-Guarded -Description ("Creation/MAJ de la GPO {0}" -f $gpoName) -Action {
+        $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+        if (-not $gpo) { $gpo = New-GPO -Name $gpoName }
+        $key = "HKLM\SOFTWARE\Policies\Microsoft\Windows\NetworkProvider\HardenedPaths"
+        Set-GPRegistryValue -Name $gpoName -Key $key -ValueName '\\*\SYSVOL' -Type String -Value "RequireMutualAuthentication=1,RequireIntegrity=1"
+        Set-GPRegistryValue -Name $gpoName -Key $key -ValueName '\\*\NETLOGON' -Type String -Value "RequireMutualAuthentication=1,RequireIntegrity=1"
+        Write-Log "GPO creee mais NON liee. Testez d'abord sur un OU pilote avant deploiement domaine entier (postes ET serveurs)." -Level WARN
+    }
+}
+
+function Invoke-Audit7SensitiveShares {
+    Write-Host "`n--- Audit des partages SMB sur des postes/serveurs choisis ---" -ForegroundColor Magenta
+    Write-Host "Signale les partages accordant un acces (hors partages administratifs $ par defaut) a" -ForegroundColor DarkGray
+    Write-Host "'Tout le monde' ou 'Utilisateurs authentifies' en modification/controle total." -ForegroundColor DarkGray
+
+    $targetOU = @(Select-OUsInteractive -Label "l'audit des partages SMB" -Verb "CIBLER")
+    if ($targetOU.Count -eq 0) { Write-Log "Aucune UO ciblee, action annulee." -Level WARN; return }
+
+    $computers = @(foreach ($ou in $targetOU) { Get-ADComputer -SearchBase $ou -Filter 'Enabled -eq $true' -Properties DNSHostName })
+    if ($computers.Count -eq 0) { Write-Log "Aucun ordinateur actif trouve dans les UO ciblees." -Level WARN; return }
+    $names = @($computers | ForEach-Object { if ($_.DNSHostName) { $_.DNSHostName } else { $_.Name } })
+    $wr = Test-DCWinRmConnectivity -ComputerNames $names
+    if ($wr.Reachable.Count -eq 0) { Write-Log "Aucune machine joignable via PowerShell Remoting (WinRM) parmi celles ciblees." -Level ERROR; return }
+
+    $rows = foreach ($name in $wr.Reachable) {
+        try {
+            Invoke-Command -ComputerName $name -ScriptBlock {
+                Get-SmbShare | Where-Object { -not $_.Special } | ForEach-Object {
+                    $share = $_
+                    Get-SmbShareAccess -Name $share.Name | Where-Object {
+                        $_.AccountName -match 'Everyone|Tout le monde|Authenticated Users|Utilisateurs authentifies' -and
+                        $_.AccessRight -in @('Full','Change')
+                    } | ForEach-Object {
+                        [PSCustomObject]@{
+                            Machine   = $env:COMPUTERNAME
+                            Partage   = $share.Name
+                            Chemin    = $share.Path
+                            Principal = $_.AccountName
+                            Droit     = $_.AccessRight
+                        }
+                    }
+                }
+            } -ErrorAction Stop
+        } catch {
+            Write-Log ("Impossible de lire les partages de {0} : {1}" -f $name, $_.Exception.Message) -Level WARN
+        }
+    }
+
+    $rows = @($rows)
+    if ($rows.Count -eq 0) { Write-Log "Aucun partage a risque (Everyone/Authenticated Users en modification ou controle total) detecte." -Level OK; return }
+
+    $rows | ForEach-Object { Write-Host ("  - {0}\{1} ({2}) : {3} -> {4}" -f $_.Machine, $_.Partage, $_.Chemin, $_.Principal, $_.Droit) -ForegroundColor Red }
+
+    $path = Join-Path $Script:LogDir ("Rapport_PartagesSensibles_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $rows | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+    Write-Log ("Rapport exporte : {0}" -f $path) -Level OK
+}
+
+function Invoke-Remediate7DisableSmb1OnComputers {
+    Write-Host "`n--- Desactivation de SMBv1 sur des postes/serveurs choisis ---" -ForegroundColor Red
+    Write-Host "Complementaire a la desactivation SMBv1 sur les DC (menu SMB > 3) : cible ici des" -ForegroundColor DarkGray
+    Write-Host "postes/serveurs membres. Consultez le rapport d'usage SMBv1 avant de continuer." -ForegroundColor DarkGray
+
+    $targetOU = @(Select-OUsInteractive -Label "la desactivation SMBv1" -Verb "CIBLER")
+    if ($targetOU.Count -eq 0) { return }
+
+    $computers = @(foreach ($ou in $targetOU) { Get-ADComputer -SearchBase $ou -Filter 'Enabled -eq $true' -Properties DNSHostName })
+    if ($computers.Count -eq 0) { Write-Log "Aucun ordinateur actif trouve dans les UO ciblees." -Level WARN; return }
+    $names = @($computers | ForEach-Object { if ($_.DNSHostName) { $_.DNSHostName } else { $_.Name } })
+    $wr = Test-DCWinRmConnectivity -ComputerNames $names
+    if ($wr.Reachable.Count -eq 0) { Write-Log "Aucune machine joignable via PowerShell Remoting (WinRM) parmi celles ciblees." -Level ERROR; return }
+
+    Write-Host ("Machines ciblees : {0}" -f ($wr.Reachable -join ', ')) -ForegroundColor Yellow
+    if (-not (Confirm-Action ("Desactiver SMBv1 (client + serveur) sur {0} machine(s)" -f $wr.Reachable.Count) -Strong)) { return }
+
+    foreach ($name in $wr.Reachable) {
+        Invoke-Guarded -Description ("Desactivation SMBv1 sur {0}" -f $name) -Action {
+            Invoke-Command -ComputerName $name -ScriptBlock {
+                Set-SmbServerConfiguration -EnableSMB1Protocol $false -Confirm:$false
+                Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart -ErrorAction SilentlyContinue | Out-Null
+            } -ErrorAction Stop
+        }
+    }
+    Write-Log "SMBv1 desactive sur les machines ciblees. Un redemarrage peut etre necessaire." -Level WARN
+}
+
+# ============================================================
+#  SECTION - LDAP / LDAPS (theme "LDAP / LDAPS" du menu)
+#  Signature/channel binding, diagnostics simple binds, certificats LDAPS,
+#  durcissement TLS, restriction des connexions LDAP anonymes.
+# ============================================================
+
+function Invoke-Audit8LdapsCertificates {
+    Write-Host "`n--- Audit des certificats LDAPS sur les DC ---" -ForegroundColor Magenta
+    Write-Host "Verifie la presence d'un certificat de serveur valide (Authentification serveur," -ForegroundColor DarkGray
+    Write-Host "correspondant au nom du DC) dans le magasin Ordinateur local de chaque DC, et teste" -ForegroundColor DarkGray
+    Write-Host "la joignabilite du port LDAPS (TCP/636)." -ForegroundColor DarkGray
+
+    $dcs = Get-DomainControllersList
+    if (-not $dcs) { return }
+    $wr = Test-DCWinRmConnectivity -ComputerNames $dcs.HostName
+    $dcs = @($dcs | Where-Object { $wr.Reachable -contains $_.HostName })
+    if (-not $dcs) { Write-Log "Aucun DC joignable via PowerShell Remoting (WinRM), action annulee." -Level ERROR; return }
+
+    $rows = foreach ($dc in $dcs) {
+        $port636 = $false
+        try { $port636 = (Test-NetConnection -ComputerName $dc.HostName -Port 636 -WarningAction SilentlyContinue).TcpTestSucceeded } catch { }
+
+        $certInfo = $null
+        try {
+            $certInfo = Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+                param($fqdn)
+                $certs = Get-ChildItem -Path Cert:\LocalMachine\My | Where-Object {
+                    $_.EnhancedKeyUsageList.ObjectId -contains '1.3.6.1.5.5.7.3.1' -and
+                    ($_.Subject -match [regex]::Escape($fqdn) -or $_.DnsNameList.Unicode -contains $fqdn)
+                }
+                if (-not $certs) { return $null }
+                $best = $certs | Sort-Object NotAfter -Descending | Select-Object -First 1
+                # Validation de la chaine de certification (jusqu'a une racine de confiance),
+                # hors verification de revocation (peut echouer si le DC n'a pas d'acces Internet
+                # vers la CRL/OCSP d'une CA publique - non pertinent pour une CA d'entreprise interne).
+                $chain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+                $chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+                $chaineValide = $chain.Build($best)
+                [PSCustomObject]@{
+                    Sujet         = $best.Subject
+                    Expiration    = $best.NotAfter
+                    ExpireBientot = ($best.NotAfter -lt (Get-Date).AddDays(60))
+                    ChaineValide  = $chaineValide
+                }
+            } -ArgumentList $dc.HostName -ErrorAction Stop
+        } catch { }
+
+        [PSCustomObject]@{
+            DC               = $dc.HostName
+            Port636Joignable = $port636
+            CertificatTrouve = [bool]$certInfo
+            Sujet            = if ($certInfo) { $certInfo.Sujet } else { $null }
+            Expiration       = if ($certInfo) { $certInfo.Expiration } else { $null }
+            ExpireSous60j    = if ($certInfo) { $certInfo.ExpireBientot } else { $null }
+            ChaineValide     = if ($certInfo) { $certInfo.ChaineValide } else { $null }
+        }
+    }
+
+    $rows | ForEach-Object {
+        $color = if (-not $_.CertificatTrouve -or -not $_.Port636Joignable -or $_.ChaineValide -eq $false) { 'Red' } elseif ($_.ExpireSous60j) { 'Yellow' } else { 'Green' }
+        Write-Host ("  - {0} : LDAPS joignable={1}, certificat trouve={2}, chaine valide={3}, expiration={4}" -f $_.DC, $_.Port636Joignable, $_.CertificatTrouve, $_.ChaineValide, $_.Expiration) -ForegroundColor $color
+    }
+
+    $path = Join-Path $Script:LogDir ("Rapport_LDAPS_Certificats_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $rows | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+    Write-Log ("Rapport exporte : {0}" -f $path) -Level OK
+}
+
+function Invoke-Audit8LdapSimpleBinds {
+    Write-Host "`n--- Audit des Simple Binds LDAP non signes ---" -ForegroundColor Magenta
+    Write-Host "Active le diagnostic '16 LDAP Interface Events' (journalisation uniquement) puis lit" -ForegroundColor DarkGray
+    Write-Host "l'evenement 2887 (resume du nombre de binds simples/non signes recus depuis le dernier" -ForegroundColor DarkGray
+    Write-Host "redemarrage), genere par le DC environ une fois toutes les 24h." -ForegroundColor DarkGray
+
+    $dcs = Get-DomainControllersList
+    if (-not $dcs) { return }
+    $wr = Test-DCWinRmConnectivity -ComputerNames $dcs.HostName
+    $dcs = @($dcs | Where-Object { $wr.Reachable -contains $_.HostName })
+    if (-not $dcs) { Write-Log "Aucun DC joignable via PowerShell Remoting (WinRM), action annulee." -Level ERROR; return }
+
+    if ((Read-Host "Activer/verifier le diagnostic LDAP Interface Events sur ces DC avant lecture ? (O/N)") -match '^[oOyY]') {
+        foreach ($dc in $dcs) {
+            Invoke-Guarded -Description ("Activation du diagnostic LDAP Interface Events sur {0}" -f $dc.HostName) -Action {
+                Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+                    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Diagnostics" -Name "16 LDAP Interface Events" -Value 2 -Type DWord
+                } -ErrorAction Stop
+            }
+        }
+        Write-Log "Diagnostic active. L'evenement 2887 se genere environ toutes les 24h : relancez cet audit demain pour un resultat exploitable." -Level WARN
+    }
+
+    $rows = foreach ($dc in $dcs) {
+        try {
+            Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+                $evt = Get-WinEvent -FilterHashtable @{ LogName = 'Directory Service'; Id = 2887 } -MaxEvents 1 -ErrorAction Stop
+                [PSCustomObject]@{
+                    DC          = $env:COMPUTERNAME
+                    TimeCreated = $evt.TimeCreated
+                    Message     = $evt.Message
+                }
+            } -ErrorAction Stop
+        } catch {
+            Write-Log ("Aucun evenement 2887 trouve sur {0} (diagnostic pas encore actif depuis 24h, ou aucun bind non signe/simple detecte)." -f $dc.HostName) -Level INFO
+        }
+    }
+
+    $rows = @($rows)
+    if ($rows.Count -eq 0) { return }
+    $path = Join-Path $Script:LogDir ("Rapport_LDAP_SimpleBinds_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $rows | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+    Write-Log ("Rapport exporte : {0}. Le detail chiffre est dans le texte du message de l'evenement 2887." -f $path) -Level OK
+}
+
+function Invoke-Remediate8DisableWeakTls {
+    Write-Host "`n--- Desactivation TLS 1.0/1.1 et activation TLS 1.2+ sur les DC (SCHANNEL) ---" -ForegroundColor Red
+    Write-Host "Risque : casse les clients LDAPS/RDP/applicatifs qui ne negocient qu'en TLS 1.0/1.1" -ForegroundColor DarkGray
+    Write-Host "         (rare sur un parc a jour, frequent sur des appliances tres anciennes)." -ForegroundColor DarkGray
+
+    $dcs = Get-DomainControllersList
+    if (-not $dcs) { return }
+    $wr = Test-DCWinRmConnectivity -ComputerNames $dcs.HostName
+    $dcs = @($dcs | Where-Object { $wr.Reachable -contains $_.HostName })
+    if (-not $dcs) { Write-Log "Aucun DC joignable via PowerShell Remoting (WinRM), action annulee." -Level ERROR; return }
+
+    if (-not (Confirm-Action "Desactiver TLS 1.0 et TLS 1.1 (client+serveur) et activer TLS 1.2, sur tous les DC" -Strong)) { return }
+
+    foreach ($dc in $dcs) {
+        Invoke-Guarded -Description ("Durcissement SCHANNEL (TLS) sur {0}" -f $dc.HostName) -Action {
+            Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+                $base = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols"
+                foreach ($proto in @('TLS 1.0','TLS 1.1')) {
+                    foreach ($role in @('Client','Server')) {
+                        $path = Join-Path $base "$proto\$role"
+                        New-Item -Path $path -Force | Out-Null
+                        Set-ItemProperty -Path $path -Name "Enabled" -Value 0 -Type DWord
+                        Set-ItemProperty -Path $path -Name "DisabledByDefault" -Value 1 -Type DWord
+                    }
+                }
+                foreach ($role in @('Client','Server')) {
+                    $path = Join-Path $base "TLS 1.2\$role"
+                    New-Item -Path $path -Force | Out-Null
+                    Set-ItemProperty -Path $path -Name "Enabled" -Value 1 -Type DWord
+                    Set-ItemProperty -Path $path -Name "DisabledByDefault" -Value 0 -Type DWord
+                }
+            } -ErrorAction Stop
+        }
+    }
+    Write-Log "Redemarrage des DC requis pour prise en compte complete des parametres SCHANNEL." -Level WARN
+}
+
+function Invoke-Remediate8RestrictAnonymousLdap {
+    Write-Host "`n--- Restriction des operations LDAP anonymes (dSHeuristics) ---" -ForegroundColor Red
+    Write-Host "Modifie le 7e caractere de l'attribut dSHeuristics (KB326690) pour interdire les" -ForegroundColor DarkGray
+    Write-Host "operations LDAP anonymes autres que le bind/la recherche sur le rootDSE." -ForegroundColor DarkGray
+    Write-Host "Risque : casse les applications qui s'appuient sciemment sur un acces LDAP anonyme" -ForegroundColor DarkGray
+    Write-Host "         (rare et deconseille, mais a verifier au prealable)." -ForegroundColor DarkGray
+
+    try {
+        $configNC = (Get-ADRootDSE).configurationNamingContext
+        $dsHeuristicsDN = "CN=Directory Service,CN=Windows NT,CN=Services,$configNC"
+        $current = (Get-ADObject -Identity $dsHeuristicsDN -Properties dSHeuristics).dSHeuristics
+    } catch {
+        Write-Log ("Impossible de lire dSHeuristics : {0}" -f $_.Exception.Message) -Level ERROR
+        return
+    }
+
+    $currentDisplay = if ([string]::IsNullOrEmpty($current)) { "(vide - valeurs par defaut)" } else { $current }
+    Write-Host ("Valeur actuelle de dSHeuristics : {0}" -f $currentDisplay) -ForegroundColor Yellow
+
+    $chars = @()
+    if ($current) { $chars = @($current.ToCharArray()) }
+    while ($chars.Count -lt 7) { $chars += '0' }
+    if ($chars[6] -eq '2') {
+        Write-Log "Les operations LDAP anonymes sont deja restreintes (7e caractere = 2)." -Level OK
+        return
+    }
+    $chars[6] = '2'
+    $newValue = -join $chars
+
+    if (-not (Confirm-Action ("Positionner dSHeuristics = '{0}' (restriction des operations LDAP anonymes)" -f $newValue) -Strong)) { return }
+
+    Invoke-Guarded -Description "Mise a jour de dSHeuristics" -Action {
+        Set-ADObject -Identity $dsHeuristicsDN -Replace @{ dSHeuristics = $newValue }
+    }
+    Write-Log "Propagation vers tous les DC de la foret par la replication AD standard." -Level INFO
+}
+
+# ============================================================
+#  SECTION - COMPTES DE SERVICE (theme "Comptes de service" du menu)
+#  Inventaire, reduction des privileges, rotation des secrets, migration vers
+#  gMSA, interdiction de connexion interactive, chiffrement AES128/AES256.
+# ============================================================
+
+function Get-SupportedEncryptionTypesLabel {
+    param([Nullable[int]]$Value)
+    if (-not $Value) { return "Non defini (heritage des parametres par defaut du domaine)" }
+    $labels = @()
+    if ($Value -band 0x1)  { $labels += "DES-CBC-CRC" }
+    if ($Value -band 0x2)  { $labels += "DES-CBC-MD5" }
+    if ($Value -band 0x4)  { $labels += "RC4-HMAC" }
+    if ($Value -band 0x8)  { $labels += "AES128" }
+    if ($Value -band 0x10) { $labels += "AES256" }
+    if ($labels.Count -eq 0) { return ("Valeur non standard ({0})" -f $Value) }
+    return ($labels -join '+')
+}
+
+function Get-ServiceAccountCandidates {
+    <#
+        Identifie les comptes "candidats compte de service" : porteurs d'au moins
+        un SPN (heuristique principale, independante de toute convention de
+        nommage), completes par une/des OU choisies interactivement (comptes de
+        service sans SPN, reperes par convention/emplacement). Reste une
+        heuristique : a valider au cas par cas avant toute remediation. Ne
+        retourne jamais de gMSA (objectClass different, non vus par Get-ADUser).
+    #>
+    $bySpn = @(Get-ADUser -LDAPFilter "(servicePrincipalName=*)" -Properties ServicePrincipalName, PasswordLastSet, PasswordNeverExpires, LastLogonDate, Enabled, Description, 'msDS-SupportedEncryptionTypes')
+    Write-Host ("{0} compte(s) porteur(s) d'au moins un SPN (heuristique principale)." -f $bySpn.Count) -ForegroundColor DarkGray
+
+    $extraOUs = @(Select-OUsInteractive -Label "des comptes de service SANS SPN (par convention/emplacement)" -Verb "AJOUTER (en plus des comptes avec SPN)")
+    $byOU = @()
+    foreach ($ou in $extraOUs) {
+        $byOU += @(Get-ADUser -SearchBase $ou -Filter * -Properties ServicePrincipalName, PasswordLastSet, PasswordNeverExpires, LastLogonDate, Enabled, Description, 'msDS-SupportedEncryptionTypes')
+    }
+
+    return @($bySpn + $byOU | Sort-Object -Property SID -Unique)
+}
+
+function Invoke-Audit4ServiceAccountsInventory {
+    Write-Host "`n--- Inventaire des comptes de service ---" -ForegroundColor Magenta
+    Write-Host "Heuristique : comptes porteurs d'un SPN, completes par des OU choisies." -ForegroundColor DarkGray
+    Write-Host "Pas de marqueur AD universel 'compte de service' : ce rapport reste une aide," -ForegroundColor DarkGray
+    Write-Host "a valider au cas par cas (proprietaire, usage reel)." -ForegroundColor DarkGray
+
+    $accounts = @(Get-ServiceAccountCandidates)
+    if ($accounts.Count -eq 0) { Write-Log "Aucun compte de service candidat trouve." -Level OK; return }
+
+    $privilegedSids = Get-ExpandedGroupMemberSids -GroupNames $Script:DefaultExcludedGroups
+
+    $rows = $accounts | ForEach-Object {
+        [PSCustomObject]@{
+            SamAccountName         = $_.SamAccountName
+            Enabled                = $_.Enabled
+            LastLogonDate          = $_.LastLogonDate
+            PasswordLastSet        = $_.PasswordLastSet
+            PasswordNeverExpires   = $_.PasswordNeverExpires
+            SPNCount               = @($_.ServicePrincipalName).Count
+            SPN                    = ($_.ServicePrincipalName -join ' | ')
+            ChiffrementSupporte    = Get-SupportedEncryptionTypesLabel -Value $_.'msDS-SupportedEncryptionTypes'
+            MembreGroupePrivilegie = $privilegedSids.Contains($_.SID.Value)
+            Description            = $_.Description
+        }
+    }
+
+    $path = Join-Path $Script:LogDir ("Rapport_ComptesDeService_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $rows | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+    Write-Log ("Rapport exporte : {0} ({1} compte(s))" -f $path, $rows.Count) -Level OK
+
+    $noOwner = @($rows | Where-Object { [string]::IsNullOrWhiteSpace($_.Description) })
+    if ($noOwner.Count -gt 0) {
+        Write-Log ("{0} compte(s) de service sans proprietaire documente dans la Description - a documenter." -f $noOwner.Count) -Level WARN
+    }
+    $inPriv = @($rows | Where-Object { $_.MembreGroupePrivilegie })
+    if ($inPriv.Count -gt 0) {
+        Write-Log ("{0} compte(s) de service membre(s) d'un groupe a privileges (voir remediation dediee)." -f $inPriv.Count) -Level WARN
+    }
+}
+
+function Invoke-Audit4WeakEncryption {
+    Write-Host "`n--- Comptes de service en chiffrement Kerberos faible (sans AES) ---" -ForegroundColor Magenta
+    $accounts = @(Get-ServiceAccountCandidates)
+    $weak = @($accounts | Where-Object {
+        $val = $_.'msDS-SupportedEncryptionTypes'
+        -not $val -or (-not ($val -band 0x8) -and -not ($val -band 0x10))
+    })
+
+    if ($weak.Count -eq 0) { Write-Log "Tous les comptes de service candidats supportent deja AES." -Level OK; return }
+
+    Write-Host ("{0} compte(s) sans AES active (RC4/DES uniquement ou valeur non definie) :" -f $weak.Count) -ForegroundColor Yellow
+    $weak | ForEach-Object { Write-Host ("  - {0} ({1})" -f $_.SamAccountName, (Get-SupportedEncryptionTypesLabel -Value $_.'msDS-SupportedEncryptionTypes')) }
+
+    $path = Join-Path $Script:LogDir ("Rapport_ComptesDeService_ChiffrementFaible_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $weak | Select-Object SamAccountName, @{N='Chiffrement';E={ Get-SupportedEncryptionTypesLabel -Value $_.'msDS-SupportedEncryptionTypes' }} |
+        Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+    Write-Log ("Rapport exporte : {0}" -f $path) -Level OK
+}
+
+function Invoke-Remediate4EnableAesOnServiceAccounts {
+    Write-Host "`n--- Forcer AES128+AES256 sur des comptes de service selectionnes ---" -ForegroundColor Red
+    Write-Host "Risque : casse l'authentification Kerberos des applications qui ne supportent QUE" -ForegroundColor DarkGray
+    Write-Host "         RC4/DES (rare mais existe sur des applis tres anciennes)." -ForegroundColor DarkGray
+
+    $accounts = @(Get-ServiceAccountCandidates | Where-Object {
+        $val = $_.'msDS-SupportedEncryptionTypes'
+        -not $val -or (-not ($val -band 0x8) -and -not ($val -band 0x10))
+    })
+    if ($accounts.Count -eq 0) { Write-Log "Aucun compte de service sans AES a corriger." -Level OK; return }
+
+    Write-Host "Comptes sans AES active :" -ForegroundColor Yellow
+    $selected = @(Select-AccountsInteractive -Accounts $accounts -Prompt "Numeros a corriger, separes par une virgule ('tous' possible, vide = annuler)")
+    if ($selected.Count -eq 0) { return }
+
+    if (-not (Confirm-Action ("Forcer AES128+AES256 sur {0} compte(s) de service" -f $selected.Count) -Strong)) { return }
+
+    foreach ($acc in $selected) {
+        Invoke-Guarded -Description ("Forcage AES128+AES256 sur {0}" -f $acc.SamAccountName) -Action {
+            Set-ADUser -Identity $acc.DistinguishedName -Replace @{ "msDS-SupportedEncryptionTypes" = 24 }
+        }
+    }
+}
+
+function Invoke-Remediate4DenyInteractiveLogon {
+    Write-Host "`n--- Interdire la connexion interactive / RDP des comptes de service ---" -ForegroundColor Red
+    Write-Host "Risque : si un compte selectionne sert aussi a une maintenance manuelle occasionnelle" -ForegroundColor DarkGray
+    Write-Host "         en session interactive, cet acces sera coupe." -ForegroundColor DarkGray
+
+    if (-not (Get-Module -ListAvailable -Name GroupPolicy)) {
+        Write-Log "Le module GroupPolicy (RSAT-GPMC) n'est pas installe sur ce poste." -Level ERROR
+        return
+    }
+    Import-Module GroupPolicy -ErrorAction SilentlyContinue
+
+    $accounts = @(Get-ServiceAccountCandidates)
+    if ($accounts.Count -eq 0) { return }
+    $selected = @(Select-AccountsInteractive -Accounts $accounts -Prompt "Numeros des comptes a restreindre, separes par une virgule ('tous' possible, vide = annuler)")
+    if ($selected.Count -eq 0) { return }
+
+    $groupName = Read-Host "Nom du groupe AD dedie a creer/completer [defaut GG-ComptesDeService-NoInteractif]"
+    if ([string]::IsNullOrWhiteSpace($groupName)) { $groupName = "GG-ComptesDeService-NoInteractif" }
+    $targetOU = @(Select-OUsInteractive -Label "la GPO d'interdiction de connexion interactive/RDP" -Verb "CIBLER (lien de la GPO)")
+    if ($targetOU.Count -eq 0) { Write-Log "Aucune UO ciblee, action annulee (la GPO ne serait liee nulle part)." -Level WARN; return }
+
+    if (-not (Confirm-Action ("Creer/completer le groupe '{0}' avec {1} compte(s), et creer/lier une GPO dediee sur {2} UO" -f $groupName, $selected.Count, $targetOU.Count) -Strong)) { return }
+
+    Invoke-Guarded -Description ("Creation/verification du groupe {0}" -f $groupName) -Action {
+        if (-not (Get-ADGroup -Filter "Name -eq '$groupName'" -ErrorAction SilentlyContinue)) {
+            New-ADGroup -Name $groupName -GroupScope Global -GroupCategory Security -Description "Comptes de service - connexion interactive/RDP interdite (ADHC)"
+        }
+        Add-ADGroupMember -Identity $groupName -Members ($selected | Select-Object -ExpandProperty SID) -ErrorAction SilentlyContinue
+    }
+
+    $gpoName = "ADHC - Comptes de service - Interdiction logon interactif"
+    Invoke-Guarded -Description ("Creation/lien de la GPO '{0}'" -f $gpoName) -Action {
+        $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+        if (-not $gpo) { $gpo = New-GPO -Name $gpoName }
+        foreach ($ou in $targetOU) {
+            try { New-GPLink -Name $gpoName -Target $ou -ErrorAction Stop | Out-Null } catch { }
+        }
+    }
+
+    Write-Log ("GPO '{0}' creee et liee, groupe '{1}' peuple. ETAPE MANUELLE OBLIGATOIRE : le module GroupPolicy ne permet pas de modifier l'Attribution des droits utilisateur - editez cette GPO dans la console GPMC (Configuration ordinateur > Parametres Windows > Parametres de securite > Strategies locales > Attribution des droits utilisateur) et ajoutez le groupe '{1}' a 'Refuser l'ouverture de session locale' ET 'Refuser l'ouverture de session par les services Bureau a distance'." -f $gpoName, $groupName) -Level WARN
+}
+
+function Invoke-Remediate4RemoveFromPrivilegedGroups {
+    Write-Host "`n--- Retirer les comptes de service des groupes a privileges ---" -ForegroundColor Red
+    Write-Host "Risque : si le compte de service a reellement besoin de ce privilege pour fonctionner," -ForegroundColor DarkGray
+    Write-Host "         le retirer cassera l'application concernee. A valider avec le proprietaire applicatif." -ForegroundColor DarkGray
+
+    $accounts = @(Get-ServiceAccountCandidates)
+    if ($accounts.Count -eq 0) { return }
+    $groups = @("Domain Admins","Enterprise Admins","Schema Admins","Administrators","Account Operators","Backup Operators","Server Operators","Print Operators")
+    $hits = @()
+    foreach ($g in $groups) {
+        try {
+            $members = @(Get-ADGroupMember -Identity $g -Recursive -ErrorAction Stop | Select-Object -ExpandProperty SID)
+            foreach ($acc in $accounts) {
+                if ($members -contains $acc.SID) { $hits += [PSCustomObject]@{ Account = $acc; Group = $g } }
+            }
+        } catch { }
+    }
+
+    if ($hits.Count -eq 0) { Write-Log "Aucun compte de service detecte dans un groupe a privileges." -Level OK; return }
+
+    Write-Host ("{0} appartenance(s) compte de service / groupe a privileges detectee(s) :" -f $hits.Count) -ForegroundColor Yellow
+    for ($i = 0; $i -lt $hits.Count; $i++) { Write-Host ("  [{0}] {1} -> {2}" -f $i, $hits[$i].Account.SamAccountName, $hits[$i].Group) }
+
+    $sel = Read-Host "Numeros a retirer, separes par une virgule ('tous' possible, vide = annuler)"
+    if ([string]::IsNullOrWhiteSpace($sel)) { return }
+    $targets = @(if ($sel.Trim() -eq 'tous') { $hits } else {
+        $idx = @($sel -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ } | Where-Object { $_ -lt $hits.Count })
+        $hits[$idx]
+    })
+    if ($targets.Count -eq 0) { return }
+
+    if (-not (Confirm-Action ("Retirer {0} appartenance(s) a un groupe a privileges" -f $targets.Count) -Strong)) { return }
+
+    foreach ($t in $targets) {
+        Invoke-Guarded -Description ("Retrait de {0} du groupe {1}" -f $t.Account.SamAccountName, $t.Group) -Action {
+            Remove-ADGroupMember -Identity $t.Group -Members $t.Account.SID -Confirm:$false
+        }
+    }
+}
+
+function Invoke-Remediate4RotatePassword {
+    Write-Host "`n--- Reinitialiser le mot de passe de comptes de service selectionnes ---" -ForegroundColor Red
+    Write-Host "ATTENTION : l'application/le service utilisant ce compte doit etre reconfigure(e) avec" -ForegroundColor Yellow
+    Write-Host "le nouveau mot de passe AVANT expiration de la session en cours, sous peine d'interruption." -ForegroundColor Yellow
+    Write-Host "Les gMSA (mot de passe gere automatiquement) ne sont jamais retournes par cet inventaire." -ForegroundColor DarkGray
+
+    $accounts = @(Get-ServiceAccountCandidates)
+    if ($accounts.Count -eq 0) { return }
+    $selected = @(Select-AccountsInteractive -Accounts $accounts -Prompt "Numeros des comptes a reinitialiser, separes par une virgule (vide = annuler ; 'tous' deconseille sur ce type d'action)")
+    if ($selected.Count -eq 0) { return }
+
+    if (-not (Confirm-Action ("Reinitialiser le mot de passe de {0} compte(s) de service (mettez a jour l'application AVANT de continuer)" -f $selected.Count) -Strong)) { return }
+
+    foreach ($acc in $selected) {
+        Invoke-Guarded -Description ("Reinitialisation du mot de passe de {0}" -f $acc.SamAccountName) -Action {
+            $newPwd = ConvertTo-SecureString (New-RandomComplexPassword -Length 32) -AsPlainText -Force
+            Set-ADAccountPassword -Identity $acc.DistinguishedName -Reset -NewPassword $newPwd -Confirm:$false
+        }
+    }
+    Write-Log "Mots de passe reinitialises (jamais affiches/journalises en clair)." -Level WARN
+}
+
+function Invoke-Remediate4CreateGmsa {
+    Write-Host "`n--- Assistant de creation d'un compte de service gere (gMSA) ---" -ForegroundColor Red
+    Write-Host "Cree un NOUVEAU gMSA : ne migre pas automatiquement un compte de service existant." -ForegroundColor DarkGray
+    Write-Host "Pour remplacer un compte existant, reconfigurez ensuite l'application pour utiliser ce" -ForegroundColor DarkGray
+    Write-Host "nouveau compte (le gMSA gere lui-meme la rotation de son mot de passe, sans intervention)." -ForegroundColor DarkGray
+
+    $gmsaName = Read-Host "Nom du gMSA a creer (max 15 caracteres, sans espace)"
+    if ([string]::IsNullOrWhiteSpace($gmsaName) -or $gmsaName.Length -gt 15 -or $gmsaName -match '\s') {
+        Write-Log "Nom invalide (vide, plus de 15 caracteres, ou contient un espace)." -Level ERROR
+        return
+    }
+    if (Get-ADServiceAccount -Filter "Name -eq '$gmsaName'" -ErrorAction SilentlyContinue) {
+        Write-Log ("Un gMSA nomme '{0}' existe deja." -f $gmsaName) -Level ERROR
+        return
+    }
+
+    $hostGroupName = Read-Host "Groupe AD des serveurs/postes autorises a recuperer le mot de passe du gMSA"
+    $hostGroup = Get-ADGroup -Filter "Name -eq '$hostGroupName'" -ErrorAction SilentlyContinue
+    if (-not $hostGroup) {
+        Write-Log ("Groupe '{0}' introuvable. Creez-le au prealable (avec les serveurs/postes hebergeant le service) et relancez." -f $hostGroupName) -Level ERROR
+        return
+    }
+
+    if (-not (Confirm-Action ("Creer le gMSA '{0}', accessible aux membres du groupe '{1}'" -f $gmsaName, $hostGroupName) -Strong)) { return }
+
+    if (-not (Get-OrEnsureKdsRootKey)) { return }
+
+    $domainDNS = (Get-ADDomain).DNSRoot
+    Invoke-Guarded -Description ("Creation du gMSA {0}" -f $gmsaName) -Action {
+        New-ADServiceAccount -Name $gmsaName -DNSHostName "$gmsaName.$domainDNS" -PrincipalsAllowedToRetrieveManagedPassword $hostGroup.DistinguishedName -Enabled $true
+    }
+
+    Write-Log ("gMSA '{0}$' cree. Sur chaque serveur/poste membre de '{1}' : Install-ADServiceAccount -Identity {0} puis Test-ADServiceAccount -Identity {0}." -f $gmsaName, $hostGroupName) -Level OK
+    Write-Log "Configurez ensuite le service/l'application pour s'executer sous ce compte (pas de mot de passe a saisir, gere automatiquement par AD)." -Level INFO
+}
+
+# ============================================================
+#  SECTION - WINDOWS LAPS (theme "Windows LAPS" du menu)
+#  Necessite le module PowerShell "LAPS" (Windows LAPS moderne, integre depuis
+#  Windows 11 22H2 / Windows Server 2022 a jour). Cible les attributs msLAPS-*,
+#  pas l'ancien LAPS legacy (ms-Mcs-AdmPwd).
+# ============================================================
+
+function Test-LapsModuleAvailable {
+    if (-not (Get-Module -ListAvailable -Name LAPS)) {
+        Write-Log "Le module PowerShell 'LAPS' (Windows LAPS) n'est pas installe sur ce poste. Installez la fonctionnalite RSAT correspondante (ou executez depuis un DC/poste a jour)." -Level ERROR
+        return $false
+    }
+    Import-Module LAPS -ErrorAction SilentlyContinue
+    return $true
+}
+
+function Test-LapsSchemaPresent {
+    try {
+        $schemaNC = (Get-ADRootDSE).schemaNamingContext
+        $attr = Get-ADObject -SearchBase $schemaNC -LDAPFilter "(lDAPDisplayName=msLAPS-Password)" -ErrorAction Stop
+        return [bool]$attr
+    } catch {
+        return $false
+    }
+}
+
+function Invoke-Audit10LapsDeployment {
+    Write-Host "`n--- Etat du deploiement Windows LAPS ---" -ForegroundColor Magenta
+
+    $schemaOk = Test-LapsSchemaPresent
+    if ($schemaOk) { Write-Log "Schema Active Directory Windows LAPS present." -Level OK }
+    else { Write-Log "Schema Active Directory Windows LAPS ABSENT. Executez la remediation 'Preparer le schema' avant tout deploiement." -Level WARN }
+
+    if (Get-Module -ListAvailable -Name LAPS) { Write-Log "Module PowerShell LAPS present sur ce poste." -Level OK }
+    else { Write-Log "Module PowerShell LAPS absent de ce poste (necessaire pour les remediations dediees)." -Level WARN }
+
+    if (-not $schemaOk) { return }
+
+    $computers = @(Get-ADComputer -Filter * -Properties 'msLAPS-PasswordExpirationTime')
+    $covered = @($computers | Where-Object { $_.'msLAPS-PasswordExpirationTime' })
+    $notCovered = @($computers | Where-Object { -not $_.'msLAPS-PasswordExpirationTime' })
+
+    $pct = if ($computers.Count -gt 0) { [math]::Round(($covered.Count / $computers.Count) * 100, 1) } else { 0 }
+    Write-Host ("Couverture LAPS : {0}/{1} ordinateurs ({2} %)" -f $covered.Count, $computers.Count, $pct) -ForegroundColor Yellow
+
+    $path = Join-Path $Script:LogDir ("Rapport_LAPS_Couverture_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    @($covered | Select-Object Name, DistinguishedName, @{N='LAPS';E={'Actif'}}) +
+    @($notCovered | Select-Object Name, DistinguishedName, @{N='LAPS';E={'Absent'}}) |
+        Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+    Write-Log ("Rapport exporte : {0}" -f $path) -Level OK
+}
+
+function Invoke-Audit10LapsPermissions {
+    Write-Host "`n--- Audit des droits de lecture/reset du mot de passe LAPS ---" -ForegroundColor Magenta
+    if (-not (Test-LapsModuleAvailable)) { return }
+
+    $targetOUs = @(Select-OUsInteractive -Label "l'audit des permissions LAPS" -Verb "CIBLER")
+    if ($targetOUs.Count -eq 0) { Write-Log "Aucune UO ciblee, action annulee." -Level WARN; return }
+
+    $rows = @()
+    foreach ($ou in $targetOUs) {
+        try {
+            $result = Find-LapsADExtendedRights -Identity $ou -ErrorAction Stop
+            foreach ($r in $result) {
+                foreach ($holder in $r.ExtendedRightHolders) {
+                    $rows += [PSCustomObject]@{ OU = $ou; Principal = $holder }
+                }
+            }
+        } catch {
+            Write-Log ("Impossible d'auditer les droits LAPS sur {0} : {1}" -f $ou, $_.Exception.Message) -Level WARN
+        }
+    }
+
+    if ($rows.Count -eq 0) { Write-Log "Aucun droit de lecture/reset LAPS trouve sur les UO ciblees (ou cmdlet indisponible)." -Level WARN; return }
+
+    Write-Host "Principaux disposant d'un droit etendu sur le mot de passe LAPS :" -ForegroundColor Yellow
+    $rows | Sort-Object Principal -Unique | ForEach-Object { Write-Host ("  - {0} (sur {1})" -f $_.Principal, $_.OU) }
+
+    $path = Join-Path $Script:LogDir ("Rapport_LAPS_Permissions_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $rows | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+    Write-Log ("Rapport exporte : {0}. Comparez avec la liste des groupes qui DEVRAIENT avoir ce droit." -f $path) -Level OK
+}
+
+function Invoke-Remediate10PrepareSchema {
+    Write-Host "`n--- Preparation du schema Active Directory pour Windows LAPS ---" -ForegroundColor Red
+    Write-Host "Modification du SCHEMA de la foret (irreversible en pratique). Necessite d'etre membre" -ForegroundColor Yellow
+    Write-Host "de Schema Admins et d'operer sur/depuis le Schema Master." -ForegroundColor Yellow
+
+    if (-not (Test-LapsModuleAvailable)) { return }
+    if (Test-LapsSchemaPresent) { Write-Log "Le schema Windows LAPS est deja present." -Level OK; return }
+
+    if (-not (Confirm-Action "Executer Update-LapsADSchema (modification du schema de la foret)" -Strong)) { return }
+
+    Invoke-Guarded -Description "Update-LapsADSchema" -Action {
+        Update-LapsADSchema -Confirm:$false -ErrorAction Stop
+    }
+}
+
+function Invoke-Remediate10DeployGpo {
+    Write-Host "`n--- Deploiement de la GPO Windows LAPS ---" -ForegroundColor Red
+
+    if (-not (Get-Module -ListAvailable -Name GroupPolicy)) {
+        Write-Log "Le module GroupPolicy (RSAT-GPMC) n'est pas installe sur ce poste." -Level ERROR
+        return
+    }
+    Import-Module GroupPolicy -ErrorAction SilentlyContinue
+
+    if (-not (Test-LapsSchemaPresent)) {
+        Write-Log "Schema Windows LAPS absent : executez d'abord 'Preparer le schema Active Directory'." -Level ERROR
+        return
+    }
+
+    $lengthInput = Read-Host "Longueur du mot de passe [defaut 20]"
+    $length = if ($lengthInput -match '^\d+$') { [int]$lengthInput } else { 20 }
+    $ageInput = Read-Host "Age maximal du mot de passe en jours [defaut 30]"
+    $age = if ($ageInput -match '^\d+$') { [int]$ageInput } else { 30 }
+
+    $hybrid = (Read-Host "Environnement hybride : sauvegarder dans Microsoft Entra ID plutot que dans Active Directory ? (O/N)") -match '^[oOyY]'
+    # BackupDirectory (policy Windows LAPS) : 1 = Azure AD / Entra ID, 2 = Active Directory.
+    $backupDirectory = if ($hybrid) { 1 } else { 2 }
+
+    $targetOUs = @(Select-OUsInteractive -Label "la GPO Windows LAPS" -Verb "CIBLER (lien de la GPO)")
+    if ($targetOUs.Count -eq 0) { Write-Log "Aucune UO ciblee, action annulee." -Level WARN; return }
+
+    $gpoName = "ADHC - Windows LAPS"
+    $backupLabel = if ($hybrid) { 'Entra ID' } else { 'Active Directory' }
+    if (-not (Confirm-Action ("Creer/MAJ la GPO '{0}' (longueur={1}, age max={2}j, sauvegarde={3}) et la lier sur {4} UO" -f $gpoName, $length, $age, $backupLabel, $targetOUs.Count) -Strong)) { return }
+
+    Invoke-Guarded -Description ("Creation/MAJ de la GPO {0}" -f $gpoName) -Action {
+        $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+        if (-not $gpo) { $gpo = New-GPO -Name $gpoName }
+        $key = "HKLM\Software\Microsoft\Policies\LAPS"
+        Set-GPRegistryValue -Name $gpoName -Key $key -ValueName "BackupDirectory" -Type DWord -Value $backupDirectory
+        Set-GPRegistryValue -Name $gpoName -Key $key -ValueName "PasswordComplexity" -Type DWord -Value 4
+        Set-GPRegistryValue -Name $gpoName -Key $key -ValueName "PasswordLength" -Type DWord -Value $length
+        Set-GPRegistryValue -Name $gpoName -Key $key -ValueName "PasswordAgeDays" -Type DWord -Value $age
+        Set-GPRegistryValue -Name $gpoName -Key $key -ValueName "PostAuthenticationResetDelay" -Type DWord -Value 4
+
+        foreach ($ou in $targetOUs) {
+            try { New-GPLink -Name $gpoName -Target $ou -ErrorAction Stop | Out-Null } catch { }
+        }
+    }
+
+    Write-Log "GPO Windows LAPS deployee et liee. Prise en compte au prochain rafraichissement de GPO sur les machines ciblees." -Level OK
+}
+
+function Invoke-Remediate10SetPermissions {
+    Write-Host "`n--- Configuration des droits de lecture/reset du mot de passe LAPS ---" -ForegroundColor Red
+    Write-Host "Modifie les ACL Active Directory : reservez ce droit au strict necessaire (equipe" -ForegroundColor DarkGray
+    Write-Host "support/securite habilitee), jamais a un groupe large type 'Tous les administrateurs'." -ForegroundColor DarkGray
+
+    if (-not (Test-LapsModuleAvailable)) { return }
+
+    $targetOUs = @(Select-OUsInteractive -Label "la delegation des droits LAPS" -Verb "CIBLER")
+    if ($targetOUs.Count -eq 0) { return }
+
+    $readGroup = Read-Host "Groupe autorise a LIRE le mot de passe LAPS (vide = ne pas modifier ce droit)"
+    $resetGroup = Read-Host "Groupe autorise a FORCER le renouvellement (reset) du mot de passe LAPS (vide = ne pas modifier ce droit)"
+    if ([string]::IsNullOrWhiteSpace($readGroup) -and [string]::IsNullOrWhiteSpace($resetGroup)) { Write-Log "Aucun groupe fourni, action annulee." -Level WARN; return }
+
+    $readLabel = if ($readGroup) { $readGroup } else { 'inchange' }
+    $resetLabel = if ($resetGroup) { $resetGroup } else { 'inchange' }
+    if (-not (Confirm-Action ("Deleguer les droits LAPS sur {0} UO (lecture={1}, reset={2})" -f $targetOUs.Count, $readLabel, $resetLabel) -Strong)) { return }
+
+    foreach ($ou in $targetOUs) {
+        if ($readGroup) {
+            Invoke-Guarded -Description ("Delegation lecture LAPS sur {0} a {1}" -f $ou, $readGroup) -Action {
+                Set-LapsADReadPasswordPermission -Identity $ou -AllowedPrincipals $readGroup -ErrorAction Stop
+            }
+        }
+        if ($resetGroup) {
+            Invoke-Guarded -Description ("Delegation reset LAPS sur {0} a {1}" -f $ou, $resetGroup) -Action {
+                Set-LapsADResetPasswordPermission -Identity $ou -AllowedPrincipals $resetGroup -ErrorAction Stop
+            }
+        }
+    }
+}
+
+# ============================================================
+#  SECTION - GPO DE DURCISSEMENT (theme "GPO de durcissement" du menu)
+#  Sauvegarde de toutes les GPO avant modification sensible, et creation du
+#  socle GPO-SEC-* nomme demande par le cahier des charges. Les remediations
+#  thematiques de ce script (LAPS, NTLM, SMB, LLMNR...) continuent pour
+#  l'instant de creer leurs propres GPO "ADHC - ..." dediees : ce theme cree
+#  les 9 GPO-SEC-* en COMPLEMENT (coquilles vides a peupler progressivement),
+#  sans toucher aux GPO existantes.
+# ============================================================
+
+$Script:GpoSecBaselineNames = @(
+    "GPO-SEC-DomainControllers",
+    "GPO-SEC-Servers",
+    "GPO-SEC-Workstations",
+    "GPO-SEC-Authentication",
+    "GPO-SEC-WindowsLAPS",
+    "GPO-SEC-Audit",
+    "GPO-SEC-Defender",
+    "GPO-SEC-RDP",
+    "GPO-SEC-Network"
+)
+
+function Invoke-Audit12GpoBaselineStatus {
+    Write-Host "`n--- Etat du socle GPO-SEC-* et des sauvegardes de GPO ---" -ForegroundColor Magenta
+
+    if (-not (Get-Module -ListAvailable -Name GroupPolicy)) {
+        Write-Log "Le module GroupPolicy (RSAT-GPMC) n'est pas installe sur ce poste." -Level ERROR
+        return
+    }
+    Import-Module GroupPolicy -ErrorAction SilentlyContinue
+
+    $rows = foreach ($name in $Script:GpoSecBaselineNames) {
+        $gpo = Get-GPO -Name $name -ErrorAction SilentlyContinue
+        [PSCustomObject]@{ GPO = $name; Presente = [bool]$gpo }
+    }
+    $rows | ForEach-Object {
+        $color = if ($_.Presente) { 'Green' } else { 'Yellow' }
+        Write-Host ("  - {0} : {1}" -f $_.GPO, $(if ($_.Presente) { 'presente' } else { 'absente' })) -ForegroundColor $color
+    }
+
+    $backupRoot = Join-Path $Script:LogDir "GPO_Backups"
+    if (Test-Path $backupRoot) {
+        $lastBackup = Get-ChildItem -Path $backupRoot -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
+        if ($lastBackup) { Write-Log ("Derniere sauvegarde complete des GPO : {0}" -f $lastBackup.FullName) -Level OK }
+        else { Write-Log "Dossier de sauvegarde des GPO present mais vide." -Level WARN }
+    } else {
+        Write-Log "Aucune sauvegarde complete des GPO trouvee dans Logs\GPO_Backups. A faire avant tout changement sensible." -Level WARN
+    }
+
+    $path = Join-Path $Script:LogDir ("Rapport_GPOBaseline_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $rows | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+    Write-Log ("Rapport exporte : {0}" -f $path) -Level OK
+}
+
+function Invoke-Remediate12BackupAllGpos {
+    Write-Host "`n--- Sauvegarde de TOUTES les GPO du domaine ---" -ForegroundColor Cyan
+    Write-Host "Impact : AUCUN (lecture seule des GPO existantes, ecriture uniquement dans Logs\GPO_Backups)." -ForegroundColor DarkGray
+    Write-Host "A faire avant tout changement sensible sur une GPO existante, pour disposer d'un retour arriere." -ForegroundColor DarkGray
+
+    if (-not (Get-Module -ListAvailable -Name GroupPolicy)) {
+        Write-Log "Le module GroupPolicy (RSAT-GPMC) n'est pas installe sur ce poste." -Level ERROR
+        return
+    }
+    Import-Module GroupPolicy -ErrorAction SilentlyContinue
+
+    $backupPath = Join-Path (Join-Path $Script:LogDir "GPO_Backups") (Get-Date -Format "yyyyMMdd_HHmmss")
+
+    if (-not (Confirm-Action ("Sauvegarder toutes les GPO du domaine vers {0}" -f $backupPath))) { return }
+
+    Invoke-Guarded -Description ("Backup-GPO -All vers {0}" -f $backupPath) -Action {
+        New-Item -Path $backupPath -ItemType Directory -Force | Out-Null
+        $results = Backup-GPO -All -Path $backupPath -ErrorAction Stop
+        Write-Log ("{0} GPO sauvegardee(s) dans {1}." -f @($results).Count, $backupPath) -Level OK
+    }
+}
+
+function Invoke-Remediate12CreateBaselineGpoShells {
+    Write-Host "`n--- Creation du socle GPO-SEC-* (coquilles vides) ---" -ForegroundColor Cyan
+    Write-Host "Impact : AUCUN sur l'existant. Cree uniquement les GPO manquantes, SANS AUCUN parametre" -ForegroundColor DarkGray
+    Write-Host "         et SANS AUCUN lien vers une OU (donc sans effet tant qu'elles ne sont pas remplies" -ForegroundColor DarkGray
+    Write-Host "         et liees deliberement)." -ForegroundColor DarkGray
+    Write-Host "Les remediations thematiques de ce script (LAPS, NTLM, SMB, LLMNR...) continuent pour" -ForegroundColor DarkGray
+    Write-Host "l'instant de creer leurs propres GPO 'ADHC - ...' dediees : ce socle nomme est un point de" -ForegroundColor DarkGray
+    Write-Host "depart a completer manuellement (ou lors d'une prochaine evolution du script)." -ForegroundColor DarkGray
+
+    if (-not (Get-Module -ListAvailable -Name GroupPolicy)) {
+        Write-Log "Le module GroupPolicy (RSAT-GPMC) n'est pas installe sur ce poste." -Level ERROR
+        return
+    }
+    Import-Module GroupPolicy -ErrorAction SilentlyContinue
+
+    $missing = @($Script:GpoSecBaselineNames | Where-Object { -not (Get-GPO -Name $_ -ErrorAction SilentlyContinue) })
+    if ($missing.Count -eq 0) { Write-Log "Les 9 GPO du socle GPO-SEC-* existent deja." -Level OK; return }
+
+    Write-Host ("GPO manquantes a creer : {0}" -f ($missing -join ', ')) -ForegroundColor Yellow
+    if (-not (Confirm-Action ("Creer les {0} GPO manquantes du socle GPO-SEC-* (non liees)" -f $missing.Count))) { return }
+
+    foreach ($name in $missing) {
+        Invoke-Guarded -Description ("Creation de la GPO {0}" -f $name) -Action {
+            New-GPO -Name $name -Comment "Socle de durcissement AD - coquille creee par le script de remediation, a completer et lier deliberement." | Out-Null
+        }
+    }
+}
+
+# ============================================================
+#  SECTION - POSTES ET SERVEURS MEMBRES (theme "Postes et serveurs" du menu)
+#  Microsoft Defender (Cloud Protection, Network Protection, SmartScreen, ASR
+#  en mode progressif Audit/Warn/Block), administrateurs locaux, RDP.
+# ============================================================
+
+function Invoke-Audit13DefenderStatus {
+    Write-Host "`n--- Etat de Microsoft Defender sur des postes/serveurs choisis ---" -ForegroundColor Magenta
+    Write-Host "Interroge directement les machines choisies (Get-MpComputerStatus/Get-MpPreference) via" -ForegroundColor DarkGray
+    Write-Host "PowerShell Remoting : necessite WinRM actif sur ces machines (comme pour les DC)." -ForegroundColor DarkGray
+
+    $targetOU = @(Select-OUsInteractive -Label "l'audit Defender" -Verb "CIBLER")
+    if ($targetOU.Count -eq 0) { Write-Log "Aucune UO ciblee, action annulee." -Level WARN; return }
+
+    $computers = @(foreach ($ou in $targetOU) { Get-ADComputer -SearchBase $ou -Filter 'Enabled -eq $true' -Properties DNSHostName })
+    if ($computers.Count -eq 0) { Write-Log "Aucun ordinateur actif trouve dans les UO ciblees." -Level WARN; return }
+
+    $names = @($computers | ForEach-Object { if ($_.DNSHostName) { $_.DNSHostName } else { $_.Name } })
+    $wr = Test-DCWinRmConnectivity -ComputerNames $names
+    if ($wr.Reachable.Count -eq 0) { Write-Log "Aucune machine joignable via PowerShell Remoting (WinRM) parmi celles ciblees." -Level ERROR; return }
+
+    $rows = foreach ($name in $wr.Reachable) {
+        try {
+            Invoke-Command -ComputerName $name -ScriptBlock {
+                $status = Get-MpComputerStatus -ErrorAction Stop
+                $pref = Get-MpPreference -ErrorAction Stop
+                [PSCustomObject]@{
+                    Machine                 = $env:COMPUTERNAME
+                    ProtectionTempsReel     = $status.RealTimeProtectionEnabled
+                    ProtectionCloud         = ($pref.MAPSReporting -ne 0)
+                    ProtectionReseau        = ($pref.EnableNetworkProtection -ne 0)
+                    NombreReglesASRDefinies = @($pref.AttackSurfaceReductionRules_Ids).Count
+                }
+            } -ErrorAction Stop
+        } catch {
+            Write-Log ("Impossible d'interroger Defender sur {0} : {1}" -f $name, $_.Exception.Message) -Level WARN
+        }
+    }
+
+    $rows = @($rows)
+    $rows | ForEach-Object { Write-Host ("  - {0} : temps reel={1}, cloud={2}, protection reseau={3}, regles ASR={4}" -f $_.Machine, $_.ProtectionTempsReel, $_.ProtectionCloud, $_.ProtectionReseau, $_.NombreReglesASRDefinies) -ForegroundColor Yellow }
+
+    $path = Join-Path $Script:LogDir ("Rapport_Defender_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $rows | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+    Write-Log ("Rapport exporte : {0}" -f $path) -Level OK
+}
+
+function Invoke-Audit13LocalAdmins {
+    Write-Host "`n--- Audit des administrateurs locaux sur des postes/serveurs choisis ---" -ForegroundColor Magenta
+
+    $targetOU = @(Select-OUsInteractive -Label "l'audit des administrateurs locaux" -Verb "CIBLER")
+    if ($targetOU.Count -eq 0) { Write-Log "Aucune UO ciblee, action annulee." -Level WARN; return }
+
+    $computers = @(foreach ($ou in $targetOU) { Get-ADComputer -SearchBase $ou -Filter 'Enabled -eq $true' -Properties DNSHostName })
+    if ($computers.Count -eq 0) { Write-Log "Aucun ordinateur actif trouve dans les UO ciblees." -Level WARN; return }
+
+    $names = @($computers | ForEach-Object { if ($_.DNSHostName) { $_.DNSHostName } else { $_.Name } })
+    $wr = Test-DCWinRmConnectivity -ComputerNames $names
+    if ($wr.Reachable.Count -eq 0) { Write-Log "Aucune machine joignable via PowerShell Remoting (WinRM) parmi celles ciblees." -Level ERROR; return }
+
+    $rows = foreach ($name in $wr.Reachable) {
+        try {
+            Invoke-Command -ComputerName $name -ScriptBlock {
+                Get-LocalGroupMember -Group "Administrateurs" -ErrorAction SilentlyContinue
+                if (-not $?) { Get-LocalGroupMember -Group "Administrators" -ErrorAction SilentlyContinue }
+            } -ErrorAction Stop | ForEach-Object {
+                [PSCustomObject]@{ Machine = $name; Membre = $_.Name; Type = $_.ObjectClass }
+            }
+        } catch {
+            Write-Log ("Impossible de lire les administrateurs locaux de {0} : {1}" -f $name, $_.Exception.Message) -Level WARN
+        }
+    }
+
+    $rows = @($rows)
+    if ($rows.Count -eq 0) { Write-Log "Aucun resultat (verifiez les droits d'acces distant aux machines ciblees)." -Level WARN; return }
+    $rows | ForEach-Object { Write-Host ("  - {0} : {1} ({2})" -f $_.Machine, $_.Membre, $_.Type) -ForegroundColor Yellow }
+
+    $path = Join-Path $Script:LogDir ("Rapport_AdminsLocaux_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $rows | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+    Write-Log ("Rapport exporte : {0}. Comparez avec la liste des comptes/groupes qui devraient legitimement etre administrateurs locaux." -f $path) -Level OK
+}
+
+function Invoke-Remediate13EnableDefenderProtections {
+    Write-Host "`n--- Renforcement Microsoft Defender via GPO (Cloud, Reseau, SmartScreen, ASR) ---" -ForegroundColor Red
+    Write-Host "Risque : le mode Bloquer des regles ASR peut bloquer une application legitime qui a un" -ForegroundColor DarkGray
+    Write-Host "         comportement proche d'une menace (faux positif). Deploiement PROGRESSIF recommande :" -ForegroundColor DarkGray
+    Write-Host "         Audit d'abord (observation sans blocage), puis Avertir, puis Bloquer." -ForegroundColor DarkGray
+
+    if (-not (Get-Module -ListAvailable -Name GroupPolicy)) {
+        Write-Log "Le module GroupPolicy (RSAT-GPMC) n'est pas installe sur ce poste." -Level ERROR
+        return
+    }
+    Import-Module GroupPolicy -ErrorAction SilentlyContinue
+
+    $modeInput = Read-Host "Mode des regles ASR [1=Audit (defaut, recommande pour commencer) / 2=Avertir / 3=Bloquer]"
+    $asrValue = switch ($modeInput) { "2" { "6" }; "3" { "1" }; default { "2" } }
+    $modeLabel = switch ($modeInput) { "2" { "Avertir" }; "3" { "Bloquer" }; default { "Audit" } }
+
+    $targetOUs = @(Select-OUsInteractive -Label "la GPO de durcissement Defender" -Verb "CIBLER (lien de la GPO)")
+    if ($targetOUs.Count -eq 0) { Write-Log "Aucune UO ciblee, action annulee." -Level WARN; return }
+
+    # Regles ASR couramment recommandees (faible taux de faux positifs) :
+    #  - Blocage des appels API Win32 depuis les macros Office
+    #  - Blocage de l'execution de scripts potentiellement obfusques
+    #  - Protection avancee contre les ransomwares
+    #  - Blocage du vol d'identifiants depuis lsass.exe
+    #  - Blocage de la creation de contenu executable par les applications Office
+    #  - Blocage du lancement de contenu executable telecharge par JavaScript/VBScript
+    $asrRules = @(
+        "92E97FA1-2EDF-4476-BDD6-9DD0B4DDDC7B",
+        "5BEB7EFE-FD9A-4556-801D-275E5FFC04CC",
+        "C1DB55AB-C21A-4637-BB3F-A12568109D35",
+        "9E6C4E1F-7D60-472F-BA1A-A39EF669E4B2",
+        "3B576869-A4EC-4529-8536-B80A7769E899",
+        "D3E037E1-3EB8-44C8-A917-57927947596D"
+    )
+
+    $gpoName = "ADHC - Defender Hardening"
+    if (-not (Confirm-Action ("Creer/MAJ la GPO '{0}' (Cloud+Reseau+SmartScreen actifs, {1} regles ASR en mode {2}) et la lier sur {3} UO" -f $gpoName, $asrRules.Count, $modeLabel, $targetOUs.Count) -Strong)) { return }
+
+    Invoke-Guarded -Description ("Creation/MAJ de la GPO {0}" -f $gpoName) -Action {
+        $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+        if (-not $gpo) { $gpo = New-GPO -Name $gpoName }
+
+        Set-GPRegistryValue -Name $gpoName -Key "HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Spynet" -ValueName "SpynetReporting" -Type DWord -Value 2
+        Set-GPRegistryValue -Name $gpoName -Key "HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Spynet" -ValueName "SubmitSamplesConsent" -Type DWord -Value 1
+        Set-GPRegistryValue -Name $gpoName -Key "HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\Network Protection" -ValueName "EnableNetworkProtection" -Type DWord -Value 1
+        Set-GPRegistryValue -Name $gpoName -Key "HKLM\SOFTWARE\Policies\Microsoft\Windows\System" -ValueName "EnableSmartScreen" -Type DWord -Value 1
+        Set-GPRegistryValue -Name $gpoName -Key "HKLM\SOFTWARE\Policies\Microsoft\Windows\System" -ValueName "ShellSmartScreenLevel" -Type String -Value "Block"
+
+        Set-GPRegistryValue -Name $gpoName -Key "HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR" -ValueName "ExploitGuard_ASR_Rules" -Type DWord -Value 1
+        foreach ($rule in $asrRules) {
+            Set-GPRegistryValue -Name $gpoName -Key "HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR\Rules" -ValueName $rule -Type String -Value $asrValue
+        }
+
+        foreach ($ou in $targetOUs) {
+            try { New-GPLink -Name $gpoName -Target $ou -ErrorAction Stop | Out-Null } catch { }
+        }
+    }
+    Write-Log ("GPO deployee en mode ASR '{0}'. Surveillez les evenements Defender (ID 1121/1122) avant de passer au mode superieur." -f $modeLabel) -Level OK
+}
+
+function Invoke-Remediate13RestrictRdp {
+    Write-Host "`n--- Restriction RDP (NLA + niveau de chiffrement) via GPO ---" -ForegroundColor Red
+    Write-Host "Risque : casse les clients RDP tres anciens ne supportant pas la Network Level" -ForegroundColor DarkGray
+    Write-Host "         Authentication (NLA) - rare sur un parc a jour." -ForegroundColor DarkGray
+
+    if (-not (Get-Module -ListAvailable -Name GroupPolicy)) {
+        Write-Log "Le module GroupPolicy (RSAT-GPMC) n'est pas installe sur ce poste." -Level ERROR
+        return
+    }
+    Import-Module GroupPolicy -ErrorAction SilentlyContinue
+
+    $targetOUs = @(Select-OUsInteractive -Label "la GPO de restriction RDP" -Verb "CIBLER (lien de la GPO)")
+    if ($targetOUs.Count -eq 0) { Write-Log "Aucune UO ciblee, action annulee." -Level WARN; return }
+
+    $gpoName = "ADHC - Restriction RDP (NLA)"
+    if (-not (Confirm-Action ("Creer/MAJ la GPO '{0}' (NLA obligatoire, chiffrement eleve) et la lier sur {1} UO" -f $gpoName, $targetOUs.Count) -Strong)) { return }
+
+    Invoke-Guarded -Description ("Creation/MAJ de la GPO {0}" -f $gpoName) -Action {
+        $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+        if (-not $gpo) { $gpo = New-GPO -Name $gpoName }
+        $key = "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+        Set-GPRegistryValue -Name $gpoName -Key $key -ValueName "UserAuthentication" -Type DWord -Value 1
+        Set-GPRegistryValue -Name $gpoName -Key $key -ValueName "MinEncryptionLevel" -Type DWord -Value 3
+        foreach ($ou in $targetOUs) {
+            try { New-GPLink -Name $gpoName -Target $ou -ErrorAction Stop | Out-Null } catch { }
+        }
+    }
+    Write-Log "GPO liee. Le controle de QUI a le droit de se connecter en RDP (groupe restreint) reste une etape manuelle dans GPMC (Attribution des droits utilisateur, non exposee par le module GroupPolicy)." -Level WARN
+}
+
+function Invoke-Remediate13CleanupLocalAdmins {
+    Write-Host "`n--- Retirer des comptes des administrateurs locaux sur des postes/serveurs choisis ---" -ForegroundColor Red
+    Write-Host "Risque : retirer un compte qui a reellement besoin de ce privilege local cassera son usage" -ForegroundColor DarkGray
+    Write-Host "         sur la machine concernee (application necessitant des droits locaux, support...)." -ForegroundColor DarkGray
+
+    $targetOU = @(Select-OUsInteractive -Label "le nettoyage des administrateurs locaux" -Verb "CIBLER")
+    if ($targetOU.Count -eq 0) { return }
+
+    $computers = @(foreach ($ou in $targetOU) { Get-ADComputer -SearchBase $ou -Filter 'Enabled -eq $true' -Properties DNSHostName })
+    if ($computers.Count -eq 0) { Write-Log "Aucun ordinateur actif trouve dans les UO ciblees." -Level WARN; return }
+    $names = @($computers | ForEach-Object { if ($_.DNSHostName) { $_.DNSHostName } else { $_.Name } })
+    $wr = Test-DCWinRmConnectivity -ComputerNames $names
+    if ($wr.Reachable.Count -eq 0) { Write-Log "Aucune machine joignable via PowerShell Remoting (WinRM) parmi celles ciblees." -Level ERROR; return }
+
+    $machine = Read-Host "Sur quelle machine agir (nom exact parmi celles ci-dessus) ?"
+    if ($wr.Reachable -notcontains $machine) { Write-Log "Machine non joignable ou non trouvee parmi les cibles." -Level ERROR; return }
+
+    $members = @()
+    try {
+        $members = Invoke-Command -ComputerName $machine -ScriptBlock {
+            try { Get-LocalGroupMember -Group "Administrateurs" -ErrorAction Stop } catch { Get-LocalGroupMember -Group "Administrators" -ErrorAction Stop }
+        } -ErrorAction Stop
+    } catch {
+        Write-Log ("Impossible de lire les administrateurs locaux de {0} : {1}" -f $machine, $_.Exception.Message) -Level ERROR
+        return
+    }
+
+    if ($members.Count -eq 0) { Write-Log "Aucun membre trouve." -Level OK; return }
+    for ($i = 0; $i -lt $members.Count; $i++) { Write-Host ("  [{0}] {1}" -f $i, $members[$i].Name) }
+    $sel = Read-Host "Numeros a retirer, separes par une virgule (vide = annuler)"
+    if ([string]::IsNullOrWhiteSpace($sel)) { return }
+    $idx = @($sel -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ } | Where-Object { $_ -lt $members.Count })
+    $targets = @($idx | ForEach-Object { $members[$_] })
+    if ($targets.Count -eq 0) { return }
+
+    if (-not (Confirm-Action ("Retirer {0} compte(s) des administrateurs locaux de {1}" -f $targets.Count, $machine) -Strong)) { return }
+
+    foreach ($t in $targets) {
+        Invoke-Guarded -Description ("Retrait de {0} des administrateurs locaux de {1}" -f $t.Name, $machine) -Action {
+            Invoke-Command -ComputerName $machine -ScriptBlock {
+                param($member)
+                try { Remove-LocalGroupMember -Group "Administrateurs" -Member $member -ErrorAction Stop }
+                catch { Remove-LocalGroupMember -Group "Administrators" -Member $member -ErrorAction Stop }
+            } -ArgumentList $t.Name -ErrorAction Stop
+        }
+    }
+}
+
+function Invoke-Remediate13EnablePowerShellLoggingExtended {
+    Write-Host "`n--- Etendre la journalisation PowerShell aux postes/serveurs choisis ---" -ForegroundColor Red
+    Write-Host "Complementaire a l'activation sur les DC (menu Journalisation et detection > 3)." -ForegroundColor DarkGray
+    Write-Host "Impact : AUCUN fonctionnel (journalisation uniquement), peut augmenter le volume de logs." -ForegroundColor DarkGray
+
+    if (-not (Get-Module -ListAvailable -Name GroupPolicy)) {
+        Write-Log "Le module GroupPolicy (RSAT-GPMC) n'est pas installe sur ce poste." -Level ERROR
+        return
+    }
+    Import-Module GroupPolicy -ErrorAction SilentlyContinue
+
+    $targetOUs = @(Select-OUsInteractive -Label "l'extension de la journalisation PowerShell" -Verb "CIBLER (lien de la GPO)")
+    if ($targetOUs.Count -eq 0) { Write-Log "Aucune UO ciblee, action annulee." -Level WARN; return }
+
+    $gpoName = "ADHC - Audit PowerShell Logging"
+    if (-not (Confirm-Action ("Lier la GPO '{0}' (creee si absente) sur {1} UO supplementaire(s)" -f $gpoName, $targetOUs.Count))) { return }
+
+    Invoke-Guarded -Description ("Extension de la GPO {0}" -f $gpoName) -Action {
+        $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+        if (-not $gpo) {
+            $gpo = New-GPO -Name $gpoName
+            Set-GPRegistryValue -Name $gpoName -Key "HKLM\Software\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging" -ValueName "EnableScriptBlockLogging" -Type DWord -Value 1
+            Set-GPRegistryValue -Name $gpoName -Key "HKLM\Software\Policies\Microsoft\Windows\PowerShell\ModuleLogging" -ValueName "EnableModuleLogging" -Type DWord -Value 1
+        }
+        foreach ($ou in $targetOUs) {
+            try { New-GPLink -Name $gpoName -Target $ou -ErrorAction Stop | Out-Null } catch { }
+        }
+    }
+}
+
+function Invoke-Remediate13DisableWindowsScriptHost {
+    Write-Host "`n--- Bloquer l'execution de scripts .vbs/.js (Windows Script Host) ---" -ForegroundColor Red
+    Write-Host "Risque : casse les scripts de connexion/outils internes bases sur WSH (.vbs, .js, .wsf)." -ForegroundColor DarkGray
+    Write-Host "         Verifiez l'absence de dependance avant d'appliquer largement." -ForegroundColor DarkGray
+
+    if (-not (Get-Module -ListAvailable -Name GroupPolicy)) {
+        Write-Log "Le module GroupPolicy (RSAT-GPMC) n'est pas installe sur ce poste." -Level ERROR
+        return
+    }
+    Import-Module GroupPolicy -ErrorAction SilentlyContinue
+
+    $targetOUs = @(Select-OUsInteractive -Label "le blocage Windows Script Host" -Verb "CIBLER (lien de la GPO)")
+    if ($targetOUs.Count -eq 0) { Write-Log "Aucune UO ciblee, action annulee." -Level WARN; return }
+
+    $gpoName = "ADHC - Blocage Windows Script Host"
+    if (-not (Confirm-Action ("Creer/MAJ la GPO '{0}' et la lier sur {1} UO" -f $gpoName, $targetOUs.Count) -Strong)) { return }
+
+    Invoke-Guarded -Description ("Creation/MAJ de la GPO {0}" -f $gpoName) -Action {
+        $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+        if (-not $gpo) { $gpo = New-GPO -Name $gpoName }
+        Set-GPRegistryValue -Name $gpoName -Key "HKLM\Software\Microsoft\Windows Script Host\Settings" -ValueName "Enabled" -Type DWord -Value 0
+        foreach ($ou in $targetOUs) {
+            try { New-GPLink -Name $gpoName -Target $ou -ErrorAction Stop | Out-Null } catch { }
+        }
+    }
+}
+
+function Invoke-Remediate13EnableFirewallBaseline {
+    Write-Host "`n--- Activer le pare-feu Windows (3 profils) sur des postes/serveurs choisis ---" -ForegroundColor Red
+    Write-Host "Risque : si des flux legitimes ne sont pas couverts par les regles predefinies actives" -ForegroundColor DarkGray
+    Write-Host "         (ou vos regles personnalisees), ils seront bloques. Testez en OU pilote." -ForegroundColor DarkGray
+
+    if (-not (Get-Module -ListAvailable -Name GroupPolicy)) {
+        Write-Log "Le module GroupPolicy (RSAT-GPMC) n'est pas installe sur ce poste." -Level ERROR
+        return
+    }
+    Import-Module GroupPolicy -ErrorAction SilentlyContinue
+
+    $targetOUs = @(Select-OUsInteractive -Label "la GPO de pare-feu" -Verb "CIBLER (lien de la GPO)")
+    if ($targetOUs.Count -eq 0) { Write-Log "Aucune UO ciblee, action annulee." -Level WARN; return }
+
+    $gpoName = "ADHC - Pare-feu Windows actif (Postes-Serveurs)"
+    if (-not (Confirm-Action ("Creer/MAJ la GPO '{0}' et la lier sur {1} UO" -f $gpoName, $targetOUs.Count) -Strong)) { return }
+
+    Invoke-Guarded -Description ("Creation/MAJ de la GPO {0}" -f $gpoName) -Action {
+        $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+        if (-not $gpo) { $gpo = New-GPO -Name $gpoName }
+        foreach ($fwProfile in @('DomainProfile','PrivateProfile','PublicProfile')) {
+            $key = "HKLM\SOFTWARE\Policies\Microsoft\WindowsFirewall\$fwProfile"
+            Set-GPRegistryValue -Name $gpoName -Key $key -ValueName "EnableFirewall" -Type DWord -Value 1
+            Set-GPRegistryValue -Name $gpoName -Key $key -ValueName "DefaultInboundAction" -Type DWord -Value 1
+        }
+        foreach ($ou in $targetOUs) {
+            try { New-GPLink -Name $gpoName -Target $ou -ErrorAction Stop | Out-Null } catch { }
+        }
+    }
+}
+
+# ============================================================
+#  SECTION - RESEAU ET ANTI-RELAY - COMPLEMENT (theme "Reseau et anti-relay")
+#  LLMNR est deja couvert (Invoke-RiskyDisableLLMNR). Complements : Global Query
+#  Block List (WPAD/ISATAP), NetBIOS, durcissement RPC et WinRM.
+# ============================================================
+
+function Invoke-Audit14GlobalQueryBlockList {
+    Write-Host "`n--- Audit de la Global Query Block List DNS (WPAD/ISATAP) ---" -ForegroundColor Magenta
+    Write-Host "Windows bloque par defaut la resolution DNS des noms 'wpad' et 'isatap' (protection" -ForegroundColor DarkGray
+    Write-Host "anti-relay integree depuis Windows Server 2008/Vista). Verifie que ce blocage par defaut" -ForegroundColor DarkGray
+    Write-Host "n'a pas ete retire par erreur sur les serveurs DNS (DC)." -ForegroundColor DarkGray
+
+    $dcs = Get-DomainControllersList
+    if (-not $dcs) { return }
+    $wr = Test-DCWinRmConnectivity -ComputerNames $dcs.HostName
+    $dcs = @($dcs | Where-Object { $wr.Reachable -contains $_.HostName })
+    if (-not $dcs) { Write-Log "Aucun DC joignable via PowerShell Remoting (WinRM), action annulee." -Level ERROR; return }
+
+    foreach ($dc in $dcs) {
+        try {
+            $list = Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+                (Get-DnsServerGlobalQueryBlockList -ErrorAction Stop)
+            } -ErrorAction Stop
+            $hasWpad = $list.List -contains 'wpad'
+            $hasIsatap = $list.List -contains 'isatap'
+            $color = if ($list.Enable -and $hasWpad -and $hasIsatap) { 'Green' } else { 'Yellow' }
+            Write-Host ("  - {0} : activee={1}, wpad={2}, isatap={3}" -f $dc.HostName, $list.Enable, $hasWpad, $hasIsatap) -ForegroundColor $color
+        } catch {
+            Write-Log ("Impossible de lire la Global Query Block List sur {0} : {1}" -f $dc.HostName, $_.Exception.Message) -Level WARN
+        }
+    }
+}
+
+function Invoke-Remediate14RestoreGlobalQueryBlockList {
+    Write-Host "`n--- Retablir la Global Query Block List DNS (wpad/isatap) ---" -ForegroundColor Cyan
+    Write-Host "Impact : restaure une protection par defaut de Windows (aucune incidence si WPAD/ISATAP" -ForegroundColor DarkGray
+    Write-Host "         ne sont pas utilises intentionnellement sur le reseau, ce qui est la norme)." -ForegroundColor DarkGray
+
+    $dcs = Get-DomainControllersList
+    if (-not $dcs) { return }
+    $wr = Test-DCWinRmConnectivity -ComputerNames $dcs.HostName
+    $dcs = @($dcs | Where-Object { $wr.Reachable -contains $_.HostName })
+    if (-not $dcs) { Write-Log "Aucun DC joignable via PowerShell Remoting (WinRM), action annulee." -Level ERROR; return }
+
+    if (-not (Confirm-Action "Retablir la Global Query Block List (wpad, isatap) activee sur tous les DC" )) { return }
+
+    foreach ($dc in $dcs) {
+        Invoke-Guarded -Description ("Retablissement de la Global Query Block List sur {0}" -f $dc.HostName) -Action {
+            Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+                Set-DnsServerGlobalQueryBlockList -List @('wpad','isatap') -Enable $true -ErrorAction Stop
+            } -ErrorAction Stop
+        }
+    }
+}
+
+function Invoke-Remediate14DisableNetbiosOnComputers {
+    Write-Host "`n--- Desactivation de NetBIOS sur TCP/IP sur des postes/serveurs choisis ---" -ForegroundColor Red
+    Write-Host "Risque : casse la resolution de nom de secours NetBIOS/NBT-NS utilisee par certaines" -ForegroundColor DarkGray
+    Write-Host "         applications/imprimantes anciennes quand le DNS echoue." -ForegroundColor DarkGray
+
+    $targetOU = @(Select-OUsInteractive -Label "la desactivation NetBIOS" -Verb "CIBLER")
+    if ($targetOU.Count -eq 0) { return }
+
+    $computers = @(foreach ($ou in $targetOU) { Get-ADComputer -SearchBase $ou -Filter 'Enabled -eq $true' -Properties DNSHostName })
+    if ($computers.Count -eq 0) { Write-Log "Aucun ordinateur actif trouve dans les UO ciblees." -Level WARN; return }
+    $names = @($computers | ForEach-Object { if ($_.DNSHostName) { $_.DNSHostName } else { $_.Name } })
+    $wr = Test-DCWinRmConnectivity -ComputerNames $names
+    if ($wr.Reachable.Count -eq 0) { Write-Log "Aucune machine joignable via PowerShell Remoting (WinRM) parmi celles ciblees." -Level ERROR; return }
+
+    Write-Host ("Machines ciblees : {0}" -f ($wr.Reachable -join ', ')) -ForegroundColor Yellow
+    if (-not (Confirm-Action ("Desactiver NetBIOS sur TCP/IP sur {0} machine(s)" -f $wr.Reachable.Count) -Strong)) { return }
+
+    foreach ($name in $wr.Reachable) {
+        Invoke-Guarded -Description ("Desactivation NetBIOS sur {0}" -f $name) -Action {
+            Invoke-Command -ComputerName $name -ScriptBlock {
+                Get-WmiObject Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True" | ForEach-Object {
+                    # SetTcpipNetbios(2) = desactiver NetBIOS sur TCP/IP pour cette interface
+                    $_.SetTcpipNetbios(2) | Out-Null
+                }
+            } -ErrorAction Stop
+        }
+    }
+}
+
+function Invoke-Remediate14RestrictRpc {
+    Write-Host "`n--- Durcissement RPC (clients non authentifies, resolution du mappeur de points terminaux) ---" -ForegroundColor Red
+    Write-Host "Risque : casse les applications RPC anciennes qui dependent de clients non authentifies" -ForegroundColor DarkGray
+    Write-Host "         (rare sur un environnement homogene Windows a jour)." -ForegroundColor DarkGray
+
+    if (-not (Get-Module -ListAvailable -Name GroupPolicy)) {
+        Write-Log "Le module GroupPolicy (RSAT-GPMC) n'est pas installe sur ce poste." -Level ERROR
+        return
+    }
+    Import-Module GroupPolicy -ErrorAction SilentlyContinue
+
+    $targetOUs = @(Select-OUsInteractive -Label "la GPO de durcissement RPC" -Verb "CIBLER (lien de la GPO)")
+    if ($targetOUs.Count -eq 0) { Write-Log "Aucune UO ciblee, action annulee." -Level WARN; return }
+
+    $gpoName = "ADHC - Durcissement RPC"
+    if (-not (Confirm-Action ("Creer/MAJ la GPO '{0}' et la lier sur {1} UO" -f $gpoName, $targetOUs.Count) -Strong)) { return }
+
+    Invoke-Guarded -Description ("Creation/MAJ de la GPO {0}" -f $gpoName) -Action {
+        $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+        if (-not $gpo) { $gpo = New-GPO -Name $gpoName }
+        $key = "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Rpc"
+        Set-GPRegistryValue -Name $gpoName -Key $key -ValueName "RestrictRemoteClients" -Type DWord -Value 1
+        Set-GPRegistryValue -Name $gpoName -Key $key -ValueName "EnableAuthEpResolution" -Type DWord -Value 1
+        foreach ($ou in $targetOUs) {
+            try { New-GPLink -Name $gpoName -Target $ou -ErrorAction Stop | Out-Null } catch { }
+        }
+    }
+}
+
+function Invoke-Remediate14RestrictWinRm {
+    Write-Host "`n--- Durcissement WinRM (authentification Basic desactivee, trafic chiffre obligatoire) ---" -ForegroundColor Red
+    Write-Host "Risque : casse les scripts/outils tiers qui se connectent en WinRM avec l'authentification" -ForegroundColor DarkGray
+    Write-Host "         Basic ou en trafic non chiffre." -ForegroundColor DarkGray
+
+    if (-not (Get-Module -ListAvailable -Name GroupPolicy)) {
+        Write-Log "Le module GroupPolicy (RSAT-GPMC) n'est pas installe sur ce poste." -Level ERROR
+        return
+    }
+    Import-Module GroupPolicy -ErrorAction SilentlyContinue
+
+    $targetOUs = @(Select-OUsInteractive -Label "la GPO de durcissement WinRM" -Verb "CIBLER (lien de la GPO)")
+    if ($targetOUs.Count -eq 0) { Write-Log "Aucune UO ciblee, action annulee." -Level WARN; return }
+
+    $gpoName = "ADHC - Durcissement WinRM"
+    if (-not (Confirm-Action ("Creer/MAJ la GPO '{0}' (Basic desactive, trafic chiffre obligatoire, client+serveur) et la lier sur {1} UO" -f $gpoName, $targetOUs.Count) -Strong)) { return }
+
+    Invoke-Guarded -Description ("Creation/MAJ de la GPO {0}" -f $gpoName) -Action {
+        $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+        if (-not $gpo) { $gpo = New-GPO -Name $gpoName }
+        Set-GPRegistryValue -Name $gpoName -Key "HKLM\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service" -ValueName "AllowBasic" -Type DWord -Value 0
+        Set-GPRegistryValue -Name $gpoName -Key "HKLM\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service" -ValueName "AllowUnencryptedTraffic" -Type DWord -Value 0
+        Set-GPRegistryValue -Name $gpoName -Key "HKLM\SOFTWARE\Policies\Microsoft\Windows\WinRM\Client" -ValueName "AllowBasic" -Type DWord -Value 0
+        Set-GPRegistryValue -Name $gpoName -Key "HKLM\SOFTWARE\Policies\Microsoft\Windows\WinRM\Client" -ValueName "AllowUnencryptedTraffic" -Type DWord -Value 0
+        foreach ($ou in $targetOUs) {
+            try { New-GPLink -Name $gpoName -Target $ou -ErrorAction Stop | Out-Null } catch { }
+        }
+    }
+}
+
+function Invoke-Remediate14RestrictSamEnumeration {
+    Write-Host "`n--- Restreindre l'enumeration distante SAM/SAMR ---" -ForegroundColor Red
+    Write-Host "Limite les appels SAMR distants (enumeration des comptes/groupes locaux) aux membres" -ForegroundColor DarkGray
+    Write-Host "du groupe Administrateurs locaux uniquement. Risque : casse les outils de supervision/" -ForegroundColor DarkGray
+    Write-Host "inventaire qui enumerent les comptes locaux via un compte non-administrateur." -ForegroundColor DarkGray
+
+    if (-not (Get-Module -ListAvailable -Name GroupPolicy)) {
+        Write-Log "Le module GroupPolicy (RSAT-GPMC) n'est pas installe sur ce poste." -Level ERROR
+        return
+    }
+    Import-Module GroupPolicy -ErrorAction SilentlyContinue
+
+    $targetOUs = @(Select-OUsInteractive -Label "la restriction SAMR" -Verb "CIBLER (lien de la GPO)")
+    if ($targetOUs.Count -eq 0) { Write-Log "Aucune UO ciblee, action annulee." -Level WARN; return }
+
+    $gpoName = "ADHC - Restriction enumeration SAMR"
+    if (-not (Confirm-Action ("Creer/MAJ la GPO '{0}' (SAMR reserve aux administrateurs locaux) et la lier sur {1} UO" -f $gpoName, $targetOUs.Count) -Strong)) { return }
+
+    Invoke-Guarded -Description ("Creation/MAJ de la GPO {0}" -f $gpoName) -Action {
+        $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+        if (-not $gpo) { $gpo = New-GPO -Name $gpoName }
+        # SDDL par defaut recommande par Microsoft : seuls les administrateurs locaux (BA) peuvent utiliser SAMR a distance.
+        Set-GPRegistryValue -Name $gpoName -Key "HKLM\SYSTEM\CurrentControlSet\Control\Lsa" -ValueName "RestrictRemoteSAM" -Type String -Value "O:BAG:BAD:(A;;RC;;;BA)"
+        foreach ($ou in $targetOUs) {
+            try { New-GPLink -Name $gpoName -Target $ou -ErrorAction Stop | Out-Null } catch { }
+        }
+    }
+}
+
+function Invoke-Audit14ExposedServices {
+    Write-Host "`n--- Audit des ports/services exposes sur les DC ---" -ForegroundColor Magenta
+    Write-Host "Liste les ports TCP en ecoute sur chaque DC, pour reperer un service expose de maniere" -ForegroundColor DarkGray
+    Write-Host "inattendue (comparer avec ce qui est reellement necessaire : AD DS, DNS, LDAP/S, Kerberos...)." -ForegroundColor DarkGray
+
+    $dcs = Get-DomainControllersList
+    if (-not $dcs) { return }
+    $wr = Test-DCWinRmConnectivity -ComputerNames $dcs.HostName
+    $dcs = @($dcs | Where-Object { $wr.Reachable -contains $_.HostName })
+    if (-not $dcs) { Write-Log "Aucun DC joignable via PowerShell Remoting (WinRM), action annulee." -Level ERROR; return }
+
+    $rows = foreach ($dc in $dcs) {
+        try {
+            Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+                Get-NetTCPConnection -State Listen -ErrorAction Stop | ForEach-Object {
+                    $procName = try { (Get-Process -Id $_.OwningProcess -ErrorAction Stop).ProcessName } catch { "?" }
+                    [PSCustomObject]@{ DC = $env:COMPUTERNAME; Port = $_.LocalPort; Processus = $procName }
+                }
+            } -ErrorAction Stop
+        } catch {
+            Write-Log ("Impossible de lister les ports en ecoute sur {0} : {1}" -f $dc.HostName, $_.Exception.Message) -Level WARN
+        }
+    }
+
+    $rows = @($rows | Sort-Object DC, Port -Unique)
+    $path = Join-Path $Script:LogDir ("Rapport_PortsExposes_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $rows | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+    Write-Log ("Rapport exporte : {0} ({1} port(s) en ecoute au total, tous DC confondus)." -f $path, $rows.Count) -Level OK
+}
+
+# ============================================================
+#  SECTION - SAUVEGARDE ET RESILIENCE AD - COMPLEMENT (theme "Sauvegarde et resilience AD")
+#  La Corbeille AD est deja couverte (Invoke-SafeEnableRecycleBin). Complements :
+#  etat des sauvegardes System State, planification, procedures de restauration.
+# ============================================================
+
+function Invoke-Audit17SystemStateBackupStatus {
+    Write-Host "`n--- Etat des sauvegardes System State sur les DC ---" -ForegroundColor Magenta
+    Write-Host "Interroge le catalogue de sauvegarde local de chaque DC (wbadmin). Necessite la" -ForegroundColor DarkGray
+    Write-Host "fonctionnalite Windows Server Backup installee et au moins une sauvegarde deja" -ForegroundColor DarkGray
+    Write-Host "effectuee pour retourner un resultat." -ForegroundColor DarkGray
+
+    $dcs = Get-DomainControllersList
+    if (-not $dcs) { return }
+    $wr = Test-DCWinRmConnectivity -ComputerNames $dcs.HostName
+    $dcs = @($dcs | Where-Object { $wr.Reachable -contains $_.HostName })
+    if (-not $dcs) { Write-Log "Aucun DC joignable via PowerShell Remoting (WinRM), action annulee." -Level ERROR; return }
+
+    $rows = foreach ($dc in $dcs) {
+        try {
+            Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+                $output = & wbadmin.exe get versions 2>&1 | Out-String
+                if ($output -match 'Version identifier:\s*([0-9/:-]+)') {
+                    [PSCustomObject]@{ DC = $env:COMPUTERNAME; SauvegardeTrouvee = $true; DerniereVersion = $Matches[1].Trim() }
+                } else {
+                    [PSCustomObject]@{ DC = $env:COMPUTERNAME; SauvegardeTrouvee = $false; DerniereVersion = $null }
+                }
+            } -ErrorAction Stop
+        } catch {
+            Write-Log ("Impossible d'interroger wbadmin sur {0} : {1}" -f $dc.HostName, $_.Exception.Message) -Level WARN
+        }
+    }
+
+    $rows = @($rows)
+    $rows | ForEach-Object {
+        $color = if ($_.SauvegardeTrouvee) { 'Green' } else { 'Red' }
+        Write-Host ("  - {0} : sauvegarde trouvee={1}, derniere version={2}" -f $_.DC, $_.SauvegardeTrouvee, $_.DerniereVersion) -ForegroundColor $color
+    }
+
+    $missing = @($rows | Where-Object { -not $_.SauvegardeTrouvee })
+    if ($missing.Count -gt 0) {
+        Write-Log ("{0} DC sans sauvegarde System State detectee. Voir la remediation dediee pour en planifier une." -f $missing.Count) -Level WARN
+    }
+
+    $path = Join-Path $Script:LogDir ("Rapport_SystemStateBackup_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $rows | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+    Write-Log ("Rapport exporte : {0}" -f $path) -Level OK
+}
+
+function Invoke-Remediate17ScheduleSystemStateBackup {
+    Write-Host "`n--- Planifier une sauvegarde System State quotidienne sur un DC ---" -ForegroundColor Red
+    Write-Host "Une sauvegarde non testee ne constitue pas une garantie de reprise : testez la" -ForegroundColor DarkGray
+    Write-Host "restauration periodiquement (voir la generation de procedures ci-dessous)." -ForegroundColor DarkGray
+    Write-Host "Recommandation : cible de sauvegarde INDEPENDANTE du domaine si possible (partage" -ForegroundColor DarkGray
+    Write-Host "reseau avec compte dedie, ou disque non joint au domaine) pour resister a une" -ForegroundColor DarkGray
+    Write-Host "compromission generalisee (ransomware chiffrant aussi les sauvegardes accessibles)." -ForegroundColor DarkGray
+
+    $dcs = Get-DomainControllersList
+    if (-not $dcs) { return }
+    Write-Host "Controleurs de domaine disponibles :"
+    for ($i = 0; $i -lt $dcs.Count; $i++) { Write-Host ("  [{0}] {1}" -f $i, $dcs[$i].HostName) }
+    $idxInput = Read-Host "DC sur lequel planifier la sauvegarde [0]"
+    $targetDC = if ($idxInput -match '^\d+$' -and [int]$idxInput -lt $dcs.Count) { $dcs[[int]$idxInput].HostName } else { $dcs[0].HostName }
+
+    $target = Read-Host "Cible de sauvegarde (ex : \\NAS\Backups\DC01 ou E: - lecteur/partage DEDIE, jamais le disque systeme)"
+    if ([string]::IsNullOrWhiteSpace($target)) { Write-Log "Cible de sauvegarde vide, action annulee." -Level WARN; return }
+
+    $timeInput = Read-Host "Heure quotidienne de la sauvegarde (format HH:mm) [defaut 01:00]"
+    if ([string]::IsNullOrWhiteSpace($timeInput) -or $timeInput -notmatch '^\d{2}:\d{2}$') { $timeInput = "01:00" }
+
+    if (-not (Confirm-Action ("Planifier une sauvegarde System State quotidienne a {0} sur {1}, cible {2}" -f $timeInput, $targetDC, $target) -Strong)) { return }
+
+    Invoke-Guarded -Description ("Installation de Windows Server Backup sur {0} (si absente)" -f $targetDC) -Action {
+        Invoke-Command -ComputerName $targetDC -ScriptBlock {
+            if (-not (Get-WindowsFeature -Name Windows-Server-Backup -ErrorAction SilentlyContinue).Installed) {
+                Install-WindowsFeature -Name Windows-Server-Backup -ErrorAction Stop | Out-Null
+            }
+        } -ErrorAction Stop
+    }
+
+    Invoke-Guarded -Description ("Creation de la tache planifiee de sauvegarde System State sur {0}" -f $targetDC) -Action {
+        Invoke-Command -ComputerName $targetDC -ScriptBlock {
+            param($backupTarget, $time)
+            $taskName = "ADHC - Sauvegarde System State"
+            $action = New-ScheduledTaskAction -Execute "wbadmin.exe" -Argument "start systemstatebackup -backupTarget:$backupTarget -quiet"
+            $trigger = New-ScheduledTaskTrigger -Daily -At $time
+            $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+            $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd
+
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+            Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description "Sauvegarde System State quotidienne - deployee par le script de remediation AD" | Out-Null
+        } -ArgumentList $target, $timeInput -ErrorAction Stop
+    }
+
+    Write-Log ("Tache planifiee creee sur {0}. Verifiez que le compte SYSTEM du DC a bien acces en ecriture a la cible '{1}' (partage reseau : autoriser le compte ordinateur {0}`$)." -f $targetDC, $target) -Level WARN
+}
+
+function Invoke-Remediate17GenerateRecoveryProcedures {
+    Write-Host "`n--- Generer les procedures de recuperation AD (objet / DC / foret) ---" -ForegroundColor Cyan
+    Write-Host "Impact : AUCUN. Ecrit uniquement des fichiers texte de procedure dans Logs\Procedures." -ForegroundColor DarkGray
+    Write-Host "Une sauvegarde non testee ne constitue pas une garantie de reprise : ces procedures sont" -ForegroundColor DarkGray
+    Write-Host "a tester en conditions reelles au moins une fois (environnement de test/labo)." -ForegroundColor DarkGray
+
+    if (-not (Confirm-Action "Generer/mettre a jour les fichiers de procedure de recuperation")) { return }
+
+    $dir = Join-Path $Script:LogDir "Procedures"
+
+    $objectRecovery = @'
+PROCEDURE - RECUPERATION D'UN OBJET AD SUPPRIME PAR ERREUR
+============================================================
+Prerequis : Corbeille Active Directory activee (menu Sauvegarde et resilience AD > 1).
+
+1. Identifier l'objet supprime :
+   Get-ADObject -Filter 'isDeleted -eq $true' -IncludeDeletedObjects -Properties * |
+     Where-Object { $_.Name -like '*<nom recherche>*' }
+
+2. Restaurer l'objet (et ses attributs) :
+   Get-ADObject -Filter 'isDeleted -eq $true' -IncludeDeletedObjects |
+     Where-Object { $_.Name -like '*<nom recherche>*' } |
+     Restore-ADObject
+
+3. Verifier l'objet restaure (appartenances de groupe, attributs) et corriger si necessaire.
+
+Si la Corbeille AD n'etait PAS activee au moment de la suppression : restauration
+authoritative necessaire depuis une sauvegarde System State (voir procedure DC ci-dessous,
+avec ntdsutil "authoritative restore" cible sur le sous-arbre concerne uniquement).
+'@
+
+    $dcRecovery = @'
+PROCEDURE - RECUPERATION D'UN CONTROLEUR DE DOMAINE
+============================================================
+Cas 1 : le DC est reparable (materiel/OS intact, AD corrompu ou horloge de replication desynchronisee)
+  1. Demarrer en mode DSRM (Directory Services Restore Mode) : bcdedit /set safeboot dsrepair, redemarrer.
+  2. Restaurer le System State depuis la derniere sauvegarde saine :
+     wbadmin start systemstaterecovery -version:<identifiant version> -backupTarget:<cible>
+  3. Si restauration AUTHORITATIVE necessaire (objets a re-propager comme faisant foi) :
+     ntdsutil
+       activate instance ntds
+       authoritative restore
+         restore subtree "<DN de l'objet ou sous-arbre>"
+  4. Redemarrer normalement (bcdedit /deletevalue safeboot), verifier la replication
+     (repadmin /replsummary, repadmin /showrepl).
+
+Cas 2 : le DC est irrecuperable (materiel detruit, corruption totale)
+  1. Nettoyer les metadonnees AD residuelles du DC mort :
+     ntdsutil -> metadata cleanup -> remove selected server
+     (ou nettoyage manuel des objets NTDS Settings, DNS, sites/services)
+  2. Retirer/recreer les enregistrements DNS obsoletes du DC.
+  3. Promouvoir un nouveau DC (meme nom ou nom different) pour retablir le nombre de DC prevu.
+
+IMPORTANT : ne jamais restaurer un DC a partir d'une sauvegarde plus ancienne que la duree de
+vie maximale du "tombstone lifetime" (par defaut 60 jours) sans expertise prealable (risque de
+"USN rollback" et de desynchronisation de la replication).
+'@
+
+    $forestRecovery = @'
+PROCEDURE (RESUME) - RECONSTRUCTION D'UNE FORET ACTIVE DIRECTORY
+============================================================
+A utiliser en dernier recours (compromission generalisee, perte de tous les DC d'un domaine).
+Suivre le "AD Forest Recovery Guide" de Microsoft pour le detail complet ; grandes etapes :
+
+1. Isoler completement l'environnement compromis (reseau deconnecte) avant toute action.
+2. Identifier le DC qui detenait le role PDC Emulator du domaine racine de la foret au moment
+   de la derniere sauvegarde saine connue.
+3. Restaurer ce DC en PREMIER, en mode non-connecte au reseau, via restauration System State
+   authoritative complete (voir procedure DC ci-dessus).
+4. Reinitialiser DEUX FOIS le mot de passe krbtgt de CHAQUE domaine de la foret (voir menu
+   Kerberos et delegations) une fois le premier DC restaure et stable, AVANT de reconnecter
+   le reseau.
+5. Reconstruire/restaurer les autres DC un par un (restauration System State ou repromotion
+   propre apres nettoyage des metadonnees), en verifiant la replication a chaque etape.
+6. Ne reconnecter le reseau de production qu'apres validation complete (replication saine,
+   SYSVOL/NETLOGON coherents, rotation krbtgt effectuee, comptes a privileges revus).
+7. Effectuer un nouvel audit PingCastle complet apres reconstruction (outil de comparaison
+   avant/apres dedie, hors perimetre de ce script).
+'@
+
+    Invoke-Guarded -Description "Generation des procedures de recuperation" -Action {
+        New-Item -Path $dir -ItemType Directory -Force | Out-Null
+        Set-Content -Path (Join-Path $dir "Recuperation_Objet.txt") -Value $objectRecovery -Encoding UTF8
+        Set-Content -Path (Join-Path $dir "Recuperation_DC.txt") -Value $dcRecovery -Encoding UTF8
+        Set-Content -Path (Join-Path $dir "Reconstruction_Foret.txt") -Value $forestRecovery -Encoding UTF8
+    }
+
+    Write-Log ("Procedures generees dans {0}." -f $dir) -Level OK
+}
+
+# ============================================================
+#  SECTION - OBSOLESCENCE (theme "Obsolescence" du menu)
+#  Inventaire des composants obsoletes/non supportes (OS, protocoles legacy) et
+#  generation d'un plan de traitement consolide. Les migrations lourdes elles-
+#  memes restent hors perimetre (projet separe, comme indique par le cahier des
+#  charges).
+# ============================================================
+
+$Script:KnownEolOsPatterns = @(
+    "Windows Server 2003", "Windows Server 2008", "Windows Server 2012",
+    "Windows XP", "Windows Vista", "Windows 7", "Windows 8"
+)
+
+function Invoke-Audit18UnsupportedOS {
+    Write-Host "`n--- Inventaire des systemes d'exploitation non/bientot non supportes ---" -ForegroundColor Magenta
+    Write-Host "Liste de reference volontairement large et a maintenir a jour (Windows Server 2012/2012" -ForegroundColor DarkGray
+    Write-Host "R2 et Windows 8.1 sont deja en fin de support standard) : verifiez la date de fin de" -ForegroundColor DarkGray
+    Write-Host "support exacte de chaque version aupres de Microsoft avant d'agir." -ForegroundColor DarkGray
+
+    $computers = @(Get-ADComputer -Filter 'Enabled -eq $true' -Properties OperatingSystem, OperatingSystemVersion, DNSHostName)
+    $flagged = @($computers | Where-Object {
+        $os = $_.OperatingSystem
+        if (-not $os) { return $false }
+        foreach ($pattern in $Script:KnownEolOsPatterns) { if ($os -like "*$pattern*") { return $true } }
+        return $false
+    })
+    $unknown = @($computers | Where-Object { -not $_.OperatingSystem })
+
+    Write-Host ("{0} ordinateur(s) actif(s) sur un OS potentiellement obsolete/EOL." -f $flagged.Count) -ForegroundColor Yellow
+    $flagged | Select-Object -First 20 | ForEach-Object { Write-Host ("  - {0} : {1}" -f $_.Name, $_.OperatingSystem) }
+    if ($flagged.Count -gt 20) { Write-Host "  - ... (liste tronquee, voir le CSV exporte)" }
+    if ($unknown.Count -gt 0) { Write-Log ("{0} ordinateur(s) sans attribut OperatingSystem renseigne (compte machine jamais authentifie ou obsolete)." -f $unknown.Count) -Level WARN }
+
+    $path = Join-Path $Script:LogDir ("Rapport_OS_Obsoletes_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $flagged | Select-Object Name, DNSHostName, OperatingSystem, OperatingSystemVersion | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+    Write-Log ("Rapport exporte : {0}" -f $path) -Level OK
+}
+
+function Invoke-Audit18LegacyProtocolsOnComputers {
+    Write-Host "`n--- Protocoles obsoletes actifs sur des postes/serveurs choisis (SMBv1, TLS 1.0/1.1) ---" -ForegroundColor Magenta
+    Write-Host "Necessite PowerShell Remoting (WinRM) actif sur les machines ciblees." -ForegroundColor DarkGray
+
+    $targetOU = @(Select-OUsInteractive -Label "l'audit des protocoles obsoletes" -Verb "CIBLER")
+    if ($targetOU.Count -eq 0) { Write-Log "Aucune UO ciblee, action annulee." -Level WARN; return }
+
+    $computers = @(foreach ($ou in $targetOU) { Get-ADComputer -SearchBase $ou -Filter 'Enabled -eq $true' -Properties DNSHostName })
+    if ($computers.Count -eq 0) { Write-Log "Aucun ordinateur actif trouve dans les UO ciblees." -Level WARN; return }
+    $names = @($computers | ForEach-Object { if ($_.DNSHostName) { $_.DNSHostName } else { $_.Name } })
+    $wr = Test-DCWinRmConnectivity -ComputerNames $names
+    if ($wr.Reachable.Count -eq 0) { Write-Log "Aucune machine joignable via PowerShell Remoting (WinRM) parmi celles ciblees." -Level ERROR; return }
+
+    $rows = foreach ($name in $wr.Reachable) {
+        try {
+            Invoke-Command -ComputerName $name -ScriptBlock {
+                $smb1 = $false
+                try { $smb1 = (Get-SmbServerConfiguration -ErrorAction Stop).EnableSMB1Protocol } catch { }
+
+                $tlsWeak = $false
+                foreach ($proto in @('TLS 1.0','TLS 1.1')) {
+                    foreach ($role in @('Client','Server')) {
+                        $p = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\$proto\$role"
+                        if (Test-Path $p) {
+                            $enabled = (Get-ItemProperty -Path $p -Name Enabled -ErrorAction SilentlyContinue).Enabled
+                            $disabledByDefault = (Get-ItemProperty -Path $p -Name DisabledByDefault -ErrorAction SilentlyContinue).DisabledByDefault
+                            if ($enabled -ne 0 -and $disabledByDefault -ne 1) { $tlsWeak = $true }
+                        } else {
+                            # Absence de cle = comportement par defaut de l'OS (TLS 1.0/1.1 souvent
+                            # encore actif par defaut sur les OS anterieurs a Windows Server 2022).
+                            $tlsWeak = $true
+                        }
+                    }
+                }
+
+                [PSCustomObject]@{ Machine = $env:COMPUTERNAME; SMB1Actif = [bool]$smb1; TLS10_11Actif = $tlsWeak }
+            } -ErrorAction Stop
+        } catch {
+            Write-Log ("Impossible d'interroger {0} : {1}" -f $name, $_.Exception.Message) -Level WARN
+        }
+    }
+
+    $rows = @($rows)
+    $rows | ForEach-Object { Write-Host ("  - {0} : SMBv1={1}, TLS 1.0/1.1={2}" -f $_.Machine, $_.SMB1Actif, $_.TLS10_11Actif) -ForegroundColor Yellow }
+
+    $path = Join-Path $Script:LogDir ("Rapport_ProtocolesObsoletes_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $rows | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+    Write-Log ("Rapport exporte : {0}" -f $path) -Level OK
+}
+
+function Invoke-Remediate18GenerateTreatmentPlan {
+    Write-Host "`n--- Generer le plan de traitement de l'obsolescence (consolide) ---" -ForegroundColor Cyan
+    Write-Host "Impact : AUCUN. Reexecute une partie des audits d'obsolescence de ce script (OS, comptes" -ForegroundColor DarkGray
+    Write-Host "de service AVEC SPN en RC4/DES) et consolide le resultat en un seul CSV categorise, pour" -ForegroundColor DarkGray
+    Write-Host "prioriser les migrations (elles-memes hors perimetre de ce script - a traiter en projet dedie)." -ForegroundColor DarkGray
+    Write-Host "Ne reprend PAS les comptes de service SANS SPN ajoutes via une OU dans le theme 'Comptes de" -ForegroundColor DarkGray
+    Write-Host "service' (choix d'UO non rejoue ici) : consultez aussi l'audit dedie pour la liste complete." -ForegroundColor DarkGray
+
+    if (-not (Confirm-Action "Lancer la consolidation du plan de traitement de l'obsolescence")) { return }
+
+    $rows = @()
+
+    $computers = @(Get-ADComputer -Filter 'Enabled -eq $true' -Properties OperatingSystem)
+    foreach ($c in $computers) {
+        $os = $c.OperatingSystem
+        if (-not $os) { continue }
+        foreach ($pattern in $Script:KnownEolOsPatterns) {
+            if ($os -like "*$pattern*") {
+                $rows += [PSCustomObject]@{ Categorie = 'OS obsolete'; Element = $c.Name; Detail = $os }
+                break
+            }
+        }
+    }
+
+    try {
+        $weakAccounts = @(Get-ADUser -LDAPFilter "(servicePrincipalName=*)" -Properties 'msDS-SupportedEncryptionTypes' |
+            Where-Object { $val = $_.'msDS-SupportedEncryptionTypes'; -not $val -or (-not ($val -band 0x8) -and -not ($val -band 0x10)) })
+        foreach ($a in $weakAccounts) {
+            $rows += [PSCustomObject]@{ Categorie = 'Compte de service avec SPN sans AES'; Element = $a.SamAccountName; Detail = (Get-SupportedEncryptionTypesLabel -Value $a.'msDS-SupportedEncryptionTypes') }
+        }
+    } catch { }
+
+    $path = Join-Path $Script:LogDir ("Plan_Traitement_Obsolescence_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $rows | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+    Write-Log ("Plan de traitement exporte : {0} ({1} constat(s)). Completez-le manuellement avec les resultats des audits SMBv1/TLS/NTLMv1 (necessitant un choix d'UO ou un delai d'observation, non rejoues automatiquement ici)." -f $path, $rows.Count) -Level OK
+}
+
+# ============================================================
+#  SECTION - JOURNALISATION ET DETECTION (theme "Journalisation et detection")
+#  L'audit avance sur les DC et la journalisation PowerShell (deja existants,
+#  ex-theme Controleurs de domaine) rejoignent ce theme dedie. Complements :
+#  audit SACL sur les objets sensibles, redirection des journaux vers un
+#  collecteur SIEM (Windows Event Forwarding).
+# ============================================================
+
+function Invoke-Audit19ObjectAuditingStatus {
+    Write-Host "`n--- Audit du SACL (auditing) sur les objets AD sensibles ---" -ForegroundColor Magenta
+    Write-Host "Verifie si un audit 'Ecriture de toutes les proprietes' (Succes) existe deja sur la" -ForegroundColor DarkGray
+    Write-Host "racine du domaine et sur AdminSDHolder - necessaire, en plus de la sous-categorie" -ForegroundColor DarkGray
+    Write-Host "'Modifications du service d'annuaire' (auditpol), pour generer les evenements 5136." -ForegroundColor DarkGray
+
+    try {
+        $domainDN = (Get-ADDomain).DistinguishedName
+        $adminSDHolderDN = "CN=AdminSDHolder,CN=System,$domainDN"
+    } catch {
+        Write-Log ("Impossible de lire le domaine : {0}" -f $_.Exception.Message) -Level ERROR
+        return
+    }
+
+    foreach ($dn in @($domainDN, $adminSDHolderDN)) {
+        try {
+            $entry = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$dn")
+            $hasAudit = $entry.ObjectSecurity.GetAuditRules($true, $true, [System.Security.Principal.SecurityIdentifier]) |
+                Where-Object { $_.AuditFlags -match 'Success' -and $_.ActiveDirectoryRights -match 'WriteProperty|GenericWrite|GenericAll' }
+            $color = if ($hasAudit) { 'Green' } else { 'Yellow' }
+            Write-Host ("  - {0} : audit ecriture deja present = {1}" -f $dn, [bool]$hasAudit) -ForegroundColor $color
+        } catch {
+            Write-Log ("Impossible de lire le SACL de {0} : {1}" -f $dn, $_.Exception.Message) -Level WARN
+        }
+    }
+}
+
+function Invoke-Remediate19ConfigureObjectAuditing {
+    Write-Host "`n--- Configurer l'audit SACL sur les objets AD sensibles ---" -ForegroundColor Red
+    Write-Host "Ajoute une regle d'audit 'Ecriture de toutes les proprietes' (Succes, tous les" -ForegroundColor DarkGray
+    Write-Host "descendants) pour 'Tout le monde' sur la racine du domaine et sur AdminSDHolder." -ForegroundColor DarkGray
+    Write-Host "Risque : augmente le volume du journal Securite des DC (deja pris en compte par" -ForegroundColor DarkGray
+    Write-Host "         l'audit avance, mais a surveiller si l'espace disque est limite)." -ForegroundColor DarkGray
+    Write-Host "Additif uniquement : n'enleve aucune regle d'audit existante." -ForegroundColor DarkGray
+
+    try {
+        $domainDN = (Get-ADDomain).DistinguishedName
+        $adminSDHolderDN = "CN=AdminSDHolder,CN=System,$domainDN"
+    } catch {
+        Write-Log ("Impossible de lire le domaine : {0}" -f $_.Exception.Message) -Level ERROR
+        return
+    }
+
+    if (-not (Confirm-Action "Ajouter l'audit d'ecriture (Succes) sur la racine du domaine et AdminSDHolder" -Strong)) { return }
+
+    foreach ($dn in @($domainDN, $adminSDHolderDN)) {
+        Invoke-Guarded -Description ("Ajout de la regle d'audit sur {0}" -f $dn) -Action {
+            $entry = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$dn")
+            $identity = New-Object System.Security.Principal.NTAccount("Everyone")
+            $auditRule = New-Object System.DirectoryServices.ActiveDirectoryAuditRule(
+                $identity,
+                [System.DirectoryServices.ActiveDirectoryRights]::WriteProperty,
+                [System.Security.AccessControl.AuditFlags]::Success,
+                [System.DirectoryServices.ActiveDirectorySecurityInheritance]::All
+            )
+            $entry.ObjectSecurity.AddAuditRule($auditRule)
+            $entry.CommitChanges()
+        }
+    }
+}
+
+function Invoke-Remediate19ConfigureEventForwarding {
+    Write-Host "`n--- Configurer la redirection des journaux vers un collecteur (SIEM / WEF) ---" -ForegroundColor Red
+    Write-Host "Pousse le parametre 'Configurer le gestionnaire d'abonnements cible' (Windows Event" -ForegroundColor DarkGray
+    Write-Host "Forwarding) vers les DC, pour qu'ils pointent vers un collecteur WEF existant." -ForegroundColor DarkGray
+    Write-Host "Prerequis : le collecteur WEF/SIEM (souscription, certificats si HTTPS) doit deja" -ForegroundColor DarkGray
+    Write-Host "exister cote client - cette action configure uniquement le POINTAGE cote DC." -ForegroundColor DarkGray
+
+    if (-not (Get-Module -ListAvailable -Name GroupPolicy)) {
+        Write-Log "Le module GroupPolicy (RSAT-GPMC) n'est pas installe sur ce poste." -Level ERROR
+        return
+    }
+    Import-Module GroupPolicy -ErrorAction SilentlyContinue
+
+    $collector = Read-Host "URL du collecteur WEF/SIEM (ex : https://collecteur.domaine.local:5986/wsman/SubscriptionManager/WEC)"
+    if ([string]::IsNullOrWhiteSpace($collector)) { Write-Log "URL vide, action annulee." -Level WARN; return }
+
+    $ouDCs = "OU=Domain Controllers,$((Get-ADDomain).DistinguishedName)"
+    $gpoName = "ADHC - Redirection journaux (WEF)"
+    if (-not (Confirm-Action ("Creer/lier la GPO '{0}' sur l'OU Domain Controllers (collecteur : {1})" -f $gpoName, $collector) -Strong)) { return }
+
+    Invoke-Guarded -Description ("Creation/MAJ de la GPO {0}" -f $gpoName) -Action {
+        $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+        if (-not $gpo) { $gpo = New-GPO -Name $gpoName }
+        $value = "Server=$collector,Refresh=60"
+        Set-GPRegistryValue -Name $gpoName -Key "HKLM\Software\Policies\Microsoft\Windows\EventLog\EventForwarding\SubscriptionManager" -ValueName "1" -Type String -Value $value
+        try { New-GPLink -Name $gpoName -Target $ouDCs -ErrorAction Stop | Out-Null } catch { }
+    }
+    Write-Log "GPO liee sur l'OU Domain Controllers. Le service WinRM (client) doit etre actif sur les DC pour que la remontee fonctionne (voir menu Controleurs de domaine)." -Level OK
+}
+
+# ============================================================
+#  SECTION - CONTROLE FINAL (theme "Controle final" du menu)
+#  Rejoue les audits cles de plusieurs themes en une seule passe pour une revue
+#  de fin de mission. Ne remplace PAS l'outil separe de comparaison PingCastle
+#  avant/apres. Le registre des exceptions documente les risques acceptes/
+#  compenses qui ne sont pas corriges par ce script.
+# ============================================================
+
+function Invoke-Audit20FinalControlReport {
+    Write-Host "`n--- Controle final consolide ---" -ForegroundColor Magenta
+    Write-Host "Rejoue une selection d'audits cles (lecture seule) de plusieurs themes deja traites par" -ForegroundColor DarkGray
+    Write-Host "ce script, y compris SMB/NTLM/Kerberos/LDAP/LAPS/GPO comme demande par le controle final." -ForegroundColor DarkGray
+    Write-Host "Chaque audit exporte deja son propre CSV horodate dans Logs\ - ce controle final se" -ForegroundColor DarkGray
+    Write-Host "contente de les enchainer. L'etape NTLMv1/LM peut etre longue (lecture du journal Securite)." -ForegroundColor DarkGray
+    Write-Host "Ne remplace pas le rapport PingCastle avant/apres (outil separe)." -ForegroundColor DarkGray
+
+    if (-not (Confirm-Action "Lancer le controle final consolide (peut prendre plusieurs minutes, plus si NTLMv1/LM est inclus)")) { return }
+
+    Write-Host "`n[1/8] Comptes a privileges..." -ForegroundColor DarkCyan
+    Invoke-ReportPrivilegedGroups
+
+    Write-Host "`n[2/8] Delegations Kerberos..." -ForegroundColor DarkCyan
+    Invoke-RiskyReportDelegations
+
+    Write-Host "`n[3/8] Mots de passe n'expirant jamais..." -ForegroundColor DarkCyan
+    Invoke-ReportPasswordNeverExpires
+
+    Write-Host "`n[4/8] Signature SMB sur les DC..." -ForegroundColor DarkCyan
+    Invoke-Audit7SmbSigningStatus
+
+    Write-Host "`n[5/8] Certificats LDAPS..." -ForegroundColor DarkCyan
+    Invoke-Audit8LdapsCertificates
+
+    Write-Host "`n[6/8] Deploiement Windows LAPS..." -ForegroundColor DarkCyan
+    Invoke-Audit10LapsDeployment
+
+    Write-Host "`n[7/8] Socle GPO-SEC-* et sauvegardes de GPO..." -ForegroundColor DarkCyan
+    Invoke-Audit12GpoBaselineStatus
+
+    Write-Host "`n[8/8] Usage NTLMv1/LM (peut etre long)..." -ForegroundColor DarkCyan
+    if ((Read-Host "Inclure l'analyse NTLMv1/LM (lecture du journal Securite, potentiellement longue) ? (O/N)") -match '^[oOyY]') {
+        Invoke-ReportNtlmV1Usage
+    } else {
+        Write-Log "Etape NTLMv1/LM ignoree. Lancez-la separement depuis le menu NTLM / LM si necessaire." -Level INFO
+    }
+
+    Write-Log "Controle final consolide termine. Consultez les rapports CSV individuels generes ci-dessus dans Logs\." -Level OK
+    Write-Log "Pensez a completer/consulter le registre des exceptions pour tout constat accepte sans correction (menu Controle final > 2)." -Level INFO
+}
+
+function Invoke-Remediate20InitExceptionsRegister {
+    Write-Host "`n--- Initialiser/completer le registre des exceptions ---" -ForegroundColor Cyan
+    Write-Host "Impact : AUCUN sur l'AD. Cree un fichier CSV pour documenter tout constat accepte sans" -ForegroundColor DarkGray
+    Write-Host "correction (risque residuel assume, mesure compensatoire en place, ou contrainte" -ForegroundColor DarkGray
+    Write-Host "metier/technique bloquant la remediation)." -ForegroundColor DarkGray
+
+    $path = Join-Path $Script:LogDir "Registre_Exceptions.csv"
+
+    if (Test-Path $path) {
+        Write-Log ("Le registre des exceptions existe deja : {0}" -f $path) -Level OK
+        return
+    }
+
+    if (-not (Confirm-Action ("Creer le registre des exceptions : {0}" -f $path))) { return }
+    Invoke-Guarded -Description "Creation du registre des exceptions" -Action {
+        [PSCustomObject]@{
+            Date         = (Get-Date -Format "dd/MM/yyyy")
+            Constat      = "<exemple : compte de service X toujours en RC4>"
+            Raison       = "<exemple : application legacy non compatible AES>"
+            Compensation = "<exemple : compte isole sur VLAN dedie, surveillance renforcee>"
+            Responsable  = "<nom/role>"
+            DateRevision = "<date de prochaine revue>"
+        } | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+    }
+
+    Write-Log "Ajoutez une ligne par exception directement dans ce fichier CSV (Excel ou un editeur de texte) au fil de la mission." -Level INFO
+}
+
+# ============================================================
+#  SECTION 3 - RAPPORTS TRANSVERSES (lecture seule, aucune modification)
+#  Rapports specifiques a un theme (privileges, delegations, NTLMv1...) : voir
+#  les fonctions Invoke-Report*/Invoke-Audit* dans les sections precedentes,
+#  rattachees a leur menu thematique.
 # ============================================================
 
 function Invoke-ReportInactiveAccounts {
@@ -1559,7 +4167,7 @@ function Invoke-ReportPasswordNeverExpires {
 
 function Invoke-ReportPrivilegedGroups {
     Write-Host "`n--- Rapport : membres des groupes a privileges ---" -ForegroundColor Magenta
-    $groups = @("Domain Admins","Enterprise Admins","Schema Admins","Administrators","Account Operators","Backup Operators","Protected Users")
+    $groups = @("Domain Admins","Enterprise Admins","Schema Admins","Administrators","Account Operators","Backup Operators","Server Operators","Print Operators","Group Policy Creator Owners","Protected Users")
     $rows = foreach ($g in $groups) {
         try {
             Get-ADGroupMember -Identity $g -Recursive -ErrorAction Stop | ForEach-Object {
@@ -1591,8 +4199,8 @@ function Invoke-ReportDCHotfixes {
 
 function Invoke-ReportNtlmV1Usage {
     Write-Host "`n--- Rapport : usage NTLMv1/LM detecte (journal Securite des DC) ---" -ForegroundColor Magenta
-    Write-Host "Necessite l'audit NTLM prealablement active (menu SAFE 'Activer l'audit NTLM') ainsi" -ForegroundColor DarkGray
-    Write-Host "que l'audit des connexions actif sur les DC (menu SAFE 'audit avance'). Sans ces deux" -ForegroundColor DarkGray
+    Write-Host "Necessite l'audit NTLM prealablement active (menu NTLM / LM > 1) ainsi" -ForegroundColor DarkGray
+    Write-Host "que l'audit des connexions actif sur les DC (menu Journalisation et detection > 2). Sans ces deux" -ForegroundColor DarkGray
     Write-Host "prerequis actifs depuis un moment, ce rapport reviendra probablement vide." -ForegroundColor DarkGray
     Write-Host "Analyse potentiellement longue sur un DC charge (lecture du journal Securite)." -ForegroundColor Yellow
 
@@ -1652,7 +4260,7 @@ function Invoke-ReportNtlmV1Usage {
     $byAccount | Select-Object -First 15 | ForEach-Object { Write-Host ("  - {0} : {1} evenement(s)" -f $_.Name, $_.Count) }
 
     Write-Log ("Rapport exporte : {0}" -f $path) -Level OK
-    Write-Log "Validez ces comptes/postes AVANT d'appliquer l'action 'Desactiver NTLMv1/LM' (menu A VALIDER)." -Level WARN
+    Write-Log "Validez ces comptes/postes AVANT d'appliquer l'action 'Desactiver NTLMv1/LM' (menu NTLM / LM > 3)." -Level WARN
 }
 
 function Invoke-ReportAll {
@@ -2048,77 +4656,627 @@ function Invoke-AutomationRemoveScheduledTask {
 #  MENUS
 # ============================================================
 
-function Show-SafeMenu {
+$Script:ThemeNames = [ordered]@{
+    1  = "Comptes a privileges"
+    2  = "Comptes de service"
+    3  = "Kerberos et delegations"
+    4  = "NTLM / LM"
+    5  = "SMB, SYSVOL et NETLOGON"
+    6  = "LDAP / LDAPS"
+    7  = "Controleurs de domaine"
+    8  = "Windows LAPS"
+    9  = "Mots de passe et authentification"
+    10 = "GPO de durcissement (socle GPO-SEC-*)"
+    11 = "Postes et serveurs membres"
+    12 = "Reseau et anti-relay"
+    13 = "Sauvegarde et resilience AD"
+    14 = "Obsolescence"
+    15 = "Journalisation et detection"
+    16 = "Controle final"
+    17 = "Rapports transverses"
+    18 = "Hygiene des comptes inactifs et automatisation"
+}
+
+# Index des actions pour la recherche par mot-cle (menu principal > [R]). Purement
+# INFORMATIF : indique ou se trouve une action (theme + numero), ne l'execute jamais
+# elle-meme - evite tout risque si ce texte se desynchronise un jour legerement du
+# libelle reellement affiche par un Show-*Menu (a tenir a jour en cas d'ajout/retrait
+# d'action, mais une desynchronisation n'a ici aucun impact fonctionnel, seulement
+# un texte de recherche legerement perime).
+$Script:ActionIndex = @(
+    [PSCustomObject]@{ Theme=1; Item=1;  Label="Export des membres des groupes a privileges" }
+    [PSCustomObject]@{ Theme=1; Item=2;  Label="Nombre de membres Domain Admins / Enterprise Admins (vs seuil)" }
+    [PSCustomObject]@{ Theme=1; Item=3;  Label="Usage du compte Administrateur integre (RID 500)" }
+    [PSCustomObject]@{ Theme=1; Item=4;  Label="Comptes a privileges potentiellement non nominatifs/partages" }
+    [PSCustomObject]@{ Theme=1; Item=5;  Label="Risque Kerberoasting sur les comptes a privileges" }
+    [PSCustomObject]@{ Theme=1; Item=6;  Label="(A VALIDER) Marquer les comptes a privileges 'Sensible, ne peut etre delegue'" }
+    [PSCustomObject]@{ Theme=1; Item=7;  Label="(A VALIDER) Ajouter les comptes Domain/Enterprise Admins dans 'Protected Users'" }
+    [PSCustomObject]@{ Theme=1; Item=8;  Label="(A VALIDER) Nettoyer le groupe Schema Admins" }
+    [PSCustomObject]@{ Theme=1; Item=9;  Label="(A VALIDER) Forcer l'expiration des mots de passe des comptes a privileges" }
+    [PSCustomObject]@{ Theme=1; Item=10; Label="(A VALIDER) Desactiver le compte Administrateur integre (RID 500)" }
+    [PSCustomObject]@{ Theme=1; Item=11; Label="(A VALIDER) Restreindre les comptes a privileges a des postes dedies (PAW)" }
+
+    [PSCustomObject]@{ Theme=2; Item=1; Label="Inventaire des comptes de service (SPN / OU choisies)" }
+    [PSCustomObject]@{ Theme=2; Item=2; Label="Comptes de service en chiffrement faible (RC4/DES, sans AES)" }
+    [PSCustomObject]@{ Theme=2; Item=3; Label="(A VALIDER) Forcer AES128+AES256 sur les comptes selectionnes" }
+    [PSCustomObject]@{ Theme=2; Item=4; Label="(A VALIDER) Interdire la connexion interactive/RDP des comptes selectionnes" }
+    [PSCustomObject]@{ Theme=2; Item=5; Label="(A VALIDER) Retirer les comptes de service des groupes a privileges" }
+    [PSCustomObject]@{ Theme=2; Item=6; Label="(A VALIDER) Reinitialiser le mot de passe des comptes selectionnes" }
+    [PSCustomObject]@{ Theme=2; Item=7; Label="(A VALIDER) Assistant de creation d'un compte de service gere (gMSA)" }
+
+    [PSCustomObject]@{ Theme=3; Item=1; Label="Rapport des delegations Kerberos (non contrainte/contrainte/RBCD)" }
+    [PSCustomObject]@{ Theme=3; Item=2; Label="Audit AS-REP Roasting (comptes sans pre-authentification)" }
+    [PSCustomObject]@{ Theme=3; Item=3; Label="Audit des relations d'approbation (trusts) et de leur chiffrement" }
+    [PSCustomObject]@{ Theme=3; Item=4; Label="(A VALIDER) Reinitialiser le mot de passe KRBTGT (1 des 2 executions requises)" }
+    [PSCustomObject]@{ Theme=3; Item=5; Label="(A VALIDER) Configurer la rotation KRBTGT automatique planifiee" }
+    [PSCustomObject]@{ Theme=3; Item=6; Label="(A VALIDER) Desactiver DES et forcer AES sur les comptes concernes" }
+    [PSCustomObject]@{ Theme=3; Item=7; Label="(A VALIDER) Corriger l'exposition AS-REP Roasting" }
+    [PSCustomObject]@{ Theme=3; Item=8; Label="(A VALIDER) Activer Kerberos Armoring (FAST)" }
+
+    [PSCustomObject]@{ Theme=4; Item=1; Label="(SAFE) Activer l'audit NTLM (detection avant tout blocage)" }
+    [PSCustomObject]@{ Theme=4; Item=2; Label="Rapport NTLMv1/LM detecte (journal Securite des DC)" }
+    [PSCustomObject]@{ Theme=4; Item=3; Label="(A VALIDER) Desactiver NTLMv1/LM (LmCompatibilityLevel) via GPO" }
+    [PSCustomObject]@{ Theme=4; Item=4; Label="(A VALIDER) Restriction progressive de NTLM sortant (Deny avec exceptions)" }
+
+    [PSCustomObject]@{ Theme=5; Item=1; Label="Detection de l'usage SMBv1 (active l'audit si besoin, puis lit le journal)" }
+    [PSCustomObject]@{ Theme=5; Item=2; Label="Etat de la signature SMB (client/serveur) sur les DC" }
+    [PSCustomObject]@{ Theme=5; Item=3; Label="Audit des partages SMB sur des postes/serveurs choisis" }
+    [PSCustomObject]@{ Theme=5; Item=4; Label="(A VALIDER) Desactiver SMBv1 (client + serveur) sur les DC" }
+    [PSCustomObject]@{ Theme=5; Item=5; Label="(A VALIDER) Desactiver SMBv1 sur des postes/serveurs choisis" }
+    [PSCustomObject]@{ Theme=5; Item=6; Label="(A VALIDER) Forcer la signature SMB (client + serveur) via GPO" }
+    [PSCustomObject]@{ Theme=5; Item=7; Label="(A VALIDER) Durcir les chemins UNC SYSVOL/NETLOGON (Hardened UNC Paths)" }
+
+    [PSCustomObject]@{ Theme=6; Item=1; Label="Audit des certificats LDAPS et joignabilite du port 636" }
+    [PSCustomObject]@{ Theme=6; Item=2; Label="Audit des Simple Binds LDAP non signes (evenement 2887)" }
+    [PSCustomObject]@{ Theme=6; Item=3; Label="(A VALIDER) Forcer la signature LDAP / channel binding sur les DC" }
+    [PSCustomObject]@{ Theme=6; Item=4; Label="(A VALIDER) Desactiver TLS 1.0/1.1 et activer TLS 1.2+ (SCHANNEL)" }
+    [PSCustomObject]@{ Theme=6; Item=5; Label="(A VALIDER) Restreindre les operations LDAP anonymes (dSHeuristics)" }
+
+    [PSCustomObject]@{ Theme=7; Item=1;  Label="Rapport des hotfix installes sur les DC" }
+    [PSCustomObject]@{ Theme=7; Item=2;  Label="Etat de la synchronisation horaire (NTP)" }
+    [PSCustomObject]@{ Theme=7; Item=3;  Label="Roles et fonctionnalites installes sur les DC" }
+    [PSCustomObject]@{ Theme=7; Item=4;  Label="(SAFE) Activer PowerShell Remoting (WinRM) sur les DC injoignables" }
+    [PSCustomObject]@{ Theme=7; Item=5;  Label="(SAFE) Desactiver le compte Invite (Guest) s'il est actif" }
+    [PSCustomObject]@{ Theme=7; Item=6;  Label="(SAFE) Proteger toutes les OU contre la suppression accidentelle" }
+    [PSCustomObject]@{ Theme=7; Item=7;  Label="(SAFE) Limiter le quota de creation d'ordinateurs (ms-DS-MachineAccountQuota = 0)" }
+    [PSCustomObject]@{ Theme=7; Item=8;  Label="(A VALIDER) Arreter/desactiver le service Spooler sur les DC" }
+    [PSCustomObject]@{ Theme=7; Item=9;  Label="(A VALIDER) Configurer la source NTP externe du PDC Emulator" }
+    [PSCustomObject]@{ Theme=7; Item=10; Label="(A VALIDER) Activer le pare-feu Windows (3 profils) sur les DC" }
+
+    [PSCustomObject]@{ Theme=8; Item=1; Label="Etat du deploiement LAPS (schema, couverture)" }
+    [PSCustomObject]@{ Theme=8; Item=2; Label="Audit des droits de lecture/reset du mot de passe LAPS" }
+    [PSCustomObject]@{ Theme=8; Item=3; Label="(A VALIDER) Preparer le schema Active Directory pour LAPS" }
+    [PSCustomObject]@{ Theme=8; Item=4; Label="(A VALIDER) Deployer la GPO Windows LAPS" }
+    [PSCustomObject]@{ Theme=8; Item=5; Label="(A VALIDER) Configurer les droits de lecture/reset LAPS" }
+
+    [PSCustomObject]@{ Theme=9; Item=1; Label="Rapport des comptes avec mot de passe n'expirant jamais" }
+    [PSCustomObject]@{ Theme=9; Item=2; Label="Audit de la politique de mot de passe par defaut du domaine" }
+    [PSCustomObject]@{ Theme=9; Item=3; Label="(SAFE) Retirer le flag 'Mot de passe non requis' sur les comptes concernes" }
+    [PSCustomObject]@{ Theme=9; Item=4; Label="(A VALIDER) Corriger la politique de mot de passe par defaut du domaine" }
+    [PSCustomObject]@{ Theme=9; Item=5; Label="(A VALIDER) Creer une Fine-Grained Password Policy pour les comptes de service" }
+    [PSCustomObject]@{ Theme=9; Item=6; Label="(SAFE) Generer les recommandations MFA / Conditional Access (hybride)" }
+
+    [PSCustomObject]@{ Theme=10; Item=1; Label="Etat du socle GPO-SEC-* et des sauvegardes de GPO" }
+    [PSCustomObject]@{ Theme=10; Item=2; Label="(SAFE) Sauvegarder TOUTES les GPO du domaine" }
+    [PSCustomObject]@{ Theme=10; Item=3; Label="(SAFE) Creer les GPO manquantes du socle GPO-SEC-* (non liees)" }
+
+    [PSCustomObject]@{ Theme=11; Item=1; Label="Etat de Microsoft Defender sur des machines choisies" }
+    [PSCustomObject]@{ Theme=11; Item=2; Label="Audit des administrateurs locaux sur des machines choisies" }
+    [PSCustomObject]@{ Theme=11; Item=3; Label="(A VALIDER) Renforcer Microsoft Defender via GPO (Cloud/Reseau/SmartScreen/ASR)" }
+    [PSCustomObject]@{ Theme=11; Item=4; Label="(A VALIDER) Restreindre RDP via GPO (NLA obligatoire)" }
+    [PSCustomObject]@{ Theme=11; Item=5; Label="(A VALIDER) Retirer des comptes des administrateurs locaux" }
+    [PSCustomObject]@{ Theme=11; Item=6; Label="(SAFE) Etendre la journalisation PowerShell aux postes/serveurs choisis" }
+    [PSCustomObject]@{ Theme=11; Item=7; Label="(A VALIDER) Bloquer les scripts .vbs/.js (Windows Script Host)" }
+    [PSCustomObject]@{ Theme=11; Item=8; Label="(A VALIDER) Activer le pare-feu Windows (3 profils)" }
+
+    [PSCustomObject]@{ Theme=12; Item=1; Label="Audit de la Global Query Block List DNS (WPAD/ISATAP)" }
+    [PSCustomObject]@{ Theme=12; Item=2; Label="Audit des ports/services exposes sur les DC" }
+    [PSCustomObject]@{ Theme=12; Item=3; Label="(A VALIDER) Desactiver LLMNR via GPO (domaine entier)" }
+    [PSCustomObject]@{ Theme=12; Item=4; Label="(SAFE) Retablir la Global Query Block List (wpad/isatap)" }
+    [PSCustomObject]@{ Theme=12; Item=5; Label="(A VALIDER) Desactiver NetBIOS sur TCP/IP sur des machines choisies" }
+    [PSCustomObject]@{ Theme=12; Item=6; Label="(A VALIDER) Durcir RPC (clients non authentifies, resolution du mappeur)" }
+    [PSCustomObject]@{ Theme=12; Item=7; Label="(A VALIDER) Durcir WinRM (authentification Basic desactivee, trafic chiffre)" }
+    [PSCustomObject]@{ Theme=12; Item=8; Label="(A VALIDER) Restreindre l'enumeration distante SAM/SAMR" }
+
+    [PSCustomObject]@{ Theme=13; Item=1; Label="Etat des sauvegardes System State sur les DC" }
+    [PSCustomObject]@{ Theme=13; Item=2; Label="(SAFE) Activer la Corbeille Active Directory" }
+    [PSCustomObject]@{ Theme=13; Item=3; Label="(A VALIDER) Planifier une sauvegarde System State quotidienne" }
+    [PSCustomObject]@{ Theme=13; Item=4; Label="(SAFE) Generer les procedures de recuperation (objet / DC / foret)" }
+
+    [PSCustomObject]@{ Theme=14; Item=1; Label="Inventaire des systemes d'exploitation non/bientot non supportes" }
+    [PSCustomObject]@{ Theme=14; Item=2; Label="Protocoles obsoletes actifs sur des machines choisies (SMBv1, TLS 1.0/1.1)" }
+    [PSCustomObject]@{ Theme=14; Item=3; Label="(SAFE) Generer le plan de traitement de l'obsolescence (consolide)" }
+
+    [PSCustomObject]@{ Theme=15; Item=1; Label="Audit du SACL sur les objets sensibles (racine du domaine, AdminSDHolder)" }
+    [PSCustomObject]@{ Theme=15; Item=2; Label="(SAFE) Activer l'audit avance sur les DC (auditpol)" }
+    [PSCustomObject]@{ Theme=15; Item=3; Label="(SAFE) Activer la journalisation PowerShell (Script Block Logging)" }
+    [PSCustomObject]@{ Theme=15; Item=4; Label="(A VALIDER) Configurer l'audit SACL sur les objets sensibles" }
+    [PSCustomObject]@{ Theme=15; Item=5; Label="(A VALIDER) Configurer la redirection des journaux vers un collecteur (WEF/SIEM)" }
+
+    [PSCustomObject]@{ Theme=16; Item=1; Label="Lancer le controle final consolide (rejoue les audits cles de plusieurs themes)" }
+    [PSCustomObject]@{ Theme=16; Item=2; Label="(SAFE) Initialiser/completer le registre des exceptions" }
+
+    [PSCustomObject]@{ Theme=17; Item=1; Label="Export comptes inactifs (utilisateurs/ordinateurs)" }
+    [PSCustomObject]@{ Theme=17; Item=2; Label="Export global (rapports rapides multi-themes)" }
+
+    [PSCustomObject]@{ Theme=18; Item=1; Label="(A VALIDER) Desactiver les comptes inactifs par anciennete (quarantaine)" }
+    [PSCustomObject]@{ Theme=18; Item=2; Label="(A VALIDER) Desactiver postes/utilisateurs a partir d'une DATE choisie" }
+    [PSCustomObject]@{ Theme=18; Item=3; Label="Configurer la tache planifiee de desactivation automatique" }
+    [PSCustomObject]@{ Theme=18; Item=4; Label="Afficher l'etat de la tache planifiee existante" }
+    [PSCustomObject]@{ Theme=18; Item=5; Label="Supprimer la tache planifiee" }
+)
+
+function Invoke-SearchActions {
+    Write-Host "`n--- Recherche d'une action par mot-cle ---" -ForegroundColor Magenta
+    Write-Host "Indique OU se trouve une action (theme + numero) ; ne l'execute pas directement -" -ForegroundColor DarkGray
+    Write-Host "rendez-vous ensuite dans le theme indique pour la lancer avec ses garde-fous habituels." -ForegroundColor DarkGray
+
+    $keyword = Read-Host "Mot-cle a rechercher (ex : kerberoasting, laps, smb1, admin, rdp...)"
+    if ([string]::IsNullOrWhiteSpace($keyword)) { return }
+
+    $results = @($Script:ActionIndex | Where-Object { $_.Label -like "*$keyword*" } | Sort-Object Theme, Item)
+    if ($results.Count -eq 0) {
+        Write-Log ("Aucune action ne correspond a '{0}'." -f $keyword) -Level WARN
+        return
+    }
+
+    Write-Host ""
+    Write-Host ("{0} resultat(s) pour '{1}' :" -f $results.Count, $keyword) -ForegroundColor Yellow
+    foreach ($r in $results) {
+        $color = if ($r.Label -match '^\(SAFE\)') { 'Green' } elseif ($r.Label -match '^\(A VALIDER\)') { 'Red' } else { 'Gray' }
+        Write-Host ("  Theme {0,2} ({1,-38}) > {2,2} : {3}" -f $r.Theme, $Script:ThemeNames[$r.Theme], $r.Item, $r.Label) -ForegroundColor $color
+    }
+}
+
+function Show-PrivilegedAccountsMenu {
     do {
         Show-Banner
-        Write-Host "=== [1] ACTIONS SAFE - aucune incidence sur la production ===" -ForegroundColor Green
-        Write-Host " 1. Activer la Corbeille Active Directory"
-        Write-Host " 2. Desactiver le compte Invite (Guest) s'il est actif"
-        Write-Host " 3. Proteger toutes les OU contre la suppression accidentelle"
-        Write-Host " 4. Limiter le quota de creation d'ordinateurs (ms-DS-MachineAccountQuota = 0)"
-        Write-Host " 5. Activer l'audit avance sur les controleurs de domaine (auditpol)"
-        Write-Host " 6. Activer la journalisation PowerShell (Script Block Logging) via GPO"
-        Write-Host " 7. Retirer le flag 'Mot de passe non requis' sur les comptes concernes"
-        Write-Host " 8. Activer l'audit NTLM (detection NTLMv1/LM avant blocage)"
-        Write-Host " 9. Activer PowerShell Remoting (WinRM) sur les DC injoignables (GPO et/ou immediat via WMI)"
-        Write-Host " 10. Executer TOUTES les actions SAFE"
+        Write-Host "=== COMPTES A PRIVILEGES ===" -ForegroundColor Cyan
+        Write-Host "--- Audit (lecture seule) ---" -ForegroundColor DarkGray
+        Write-MenuItem "1" "Export des membres des groupes a privileges"
+        Write-MenuItem "2" "Nombre de membres Domain Admins / Enterprise Admins (vs seuil)"
+        Write-MenuItem "3" "Usage du compte Administrateur integre (RID 500)"
+        Write-MenuItem "4" "Comptes a privileges potentiellement non nominatifs/partages"
+        Write-MenuItem "5" "Risque Kerberoasting sur les comptes a privileges"
+        Write-Host "--- Remediation ---" -ForegroundColor DarkGray
+        Write-MenuItem "6" "(A VALIDER) Marquer les comptes a privileges 'Sensible, ne peut etre delegue'"
+        Write-MenuItem "7" "(A VALIDER) Ajouter les comptes Domain/Enterprise Admins dans 'Protected Users'"
+        Write-MenuItem "8" "(A VALIDER) Nettoyer le groupe Schema Admins"
+        Write-MenuItem "9" "(A VALIDER) Forcer l'expiration des mots de passe des comptes a privileges"
+        Write-MenuItem "10" "(A VALIDER) Desactiver le compte Administrateur integre (RID 500)"
+        Write-MenuItem "11" "(A VALIDER) Restreindre les comptes a privileges a des postes dedies (PAW)"
         Write-Host " 0. Retour au menu principal"
         Write-Host ""
         $choice = Read-Host "Votre choix"
         switch ($choice) {
-            "1"  { Invoke-SafeEnableRecycleBin; Pause-Menu }
-            "2"  { Invoke-SafeDisableGuest; Pause-Menu }
-            "3"  { Invoke-SafeProtectOUs; Pause-Menu }
-            "4"  { Invoke-SafeSetMachineAccountQuotaZero; Pause-Menu }
-            "5"  { Invoke-SafeEnableDCAuditPolicy; Pause-Menu }
-            "6"  { Invoke-SafeEnablePowerShellLogging; Pause-Menu }
-            "7"  { Invoke-SafeClearPasswordNotRequired; Pause-Menu }
-            "8"  { Invoke-SafeEnableNtlmAudit; Pause-Menu }
-            "9"  { Invoke-SafeEnableWinRmOnDCs; Pause-Menu }
-            "10" { Invoke-SafeAll; Pause-Menu }
+            "1"  { Invoke-ReportPrivilegedGroups; Pause-Menu }
+            "2"  { Invoke-Audit3DomainAdminsCount; Pause-Menu }
+            "3"  { Invoke-Audit3BuiltinAdministratorStatus; Pause-Menu }
+            "4"  { Invoke-Audit3NonNominativeAccounts; Pause-Menu }
+            "5"  { Invoke-Audit3KerberoastingRisk; Pause-Menu }
+            "6"  { Invoke-RiskySetPrivilegedNotDelegated; Pause-Menu }
+            "7"  { Invoke-RiskyAddToProtectedUsers; Pause-Menu }
+            "8"  { Invoke-RiskyCleanupSchemaAdmins; Pause-Menu }
+            "9"  { Invoke-RiskyForcePasswordExpirationPrivileged; Pause-Menu }
+            "10" { Invoke-Remediate3DisableBuiltinAdministrator; Pause-Menu }
+            "11" { Invoke-Remediate3RestrictPrivilegedLogonWorkstations; Pause-Menu }
             "0" { return }
             default { }
         }
     } while ($true)
 }
 
-function Show-RiskyMenu {
+function Show-ServiceAccountsMenu {
     do {
         Show-Banner
-        Write-Host "=== [2] ACTIONS A VALIDER - impact potentiel, fenetre de maintenance recommandee ===" -ForegroundColor Red
-        Write-Host " 1.  Reinitialiser le mot de passe KRBTGT (1 des 2 executions requises)"
-        Write-Host " 2.  Desactiver NTLMv1/LM (LmCompatibilityLevel) via GPO"
-        Write-Host " 3.  Desactiver DES et forcer AES sur les comptes concernes"
-        Write-Host " 4.  Marquer les comptes a privileges 'Sensible, ne peut etre delegue'"
-        Write-Host " 5.  Ajouter les comptes Domain/Enterprise Admins dans 'Protected Users'"
-        Write-Host " 6.  Rapport des delegations Kerberos (non contrainte/contrainte/RBCD)"
-        Write-Host " 7.  Nettoyer le groupe Schema Admins"
-        Write-Host " 8.  Arreter/desactiver le service Spooler sur les controleurs de domaine"
-        Write-Host " 9.  Forcer la signature LDAP / channel binding sur les DC"
-        Write-Host " 10. Desactiver LLMNR via GPO (domaine entier)"
-        Write-Host " 11. Desactiver les comptes utilisateurs/ordinateurs inactifs (quarantaine)"
-        Write-Host " 12. Forcer l'expiration des mots de passe des comptes a privileges"
-        Write-Host " 13. Configurer la rotation KRBTGT automatique planifiee (gMSA dedie + tache planifiee)"
-        Write-Host " 14. Desactiver postes/serveurs ET/OU utilisateurs a partir d'une DATE choisie (UO dediees + garde-fous)"
-        Write-Host " 0.  Retour au menu principal"
+        Write-Host "=== COMPTES DE SERVICE ===" -ForegroundColor Cyan
+        Write-Host "--- Audit (lecture seule) ---" -ForegroundColor DarkGray
+        Write-MenuItem "1" "Inventaire des comptes de service (SPN / OU choisies)"
+        Write-MenuItem "2" "Comptes de service en chiffrement faible (RC4/DES, sans AES)"
+        Write-Host "--- Remediation ---" -ForegroundColor DarkGray
+        Write-MenuItem "3" "(A VALIDER) Forcer AES128+AES256 sur les comptes selectionnes"
+        Write-MenuItem "4" "(A VALIDER) Interdire la connexion interactive/RDP des comptes selectionnes"
+        Write-MenuItem "5" "(A VALIDER) Retirer les comptes de service des groupes a privileges"
+        Write-MenuItem "6" "(A VALIDER) Reinitialiser le mot de passe des comptes selectionnes"
+        Write-MenuItem "7" "(A VALIDER) Assistant de creation d'un compte de service gere (gMSA)"
+        Write-Host " 0. Retour au menu principal"
         Write-Host ""
         $choice = Read-Host "Votre choix"
         switch ($choice) {
-            "1"  { Invoke-RiskyResetKrbtgt; Pause-Menu }
-            "2"  { Invoke-RiskyDisableNtlmV1; Pause-Menu }
-            "3"  { Invoke-RiskyDisableDesForceAes; Pause-Menu }
-            "4"  { Invoke-RiskySetPrivilegedNotDelegated; Pause-Menu }
-            "5"  { Invoke-RiskyAddToProtectedUsers; Pause-Menu }
-            "6"  { Invoke-RiskyReportDelegations; Pause-Menu }
-            "7"  { Invoke-RiskyCleanupSchemaAdmins; Pause-Menu }
+            "1" { Invoke-Audit4ServiceAccountsInventory; Pause-Menu }
+            "2" { Invoke-Audit4WeakEncryption; Pause-Menu }
+            "3" { Invoke-Remediate4EnableAesOnServiceAccounts; Pause-Menu }
+            "4" { Invoke-Remediate4DenyInteractiveLogon; Pause-Menu }
+            "5" { Invoke-Remediate4RemoveFromPrivilegedGroups; Pause-Menu }
+            "6" { Invoke-Remediate4RotatePassword; Pause-Menu }
+            "7" { Invoke-Remediate4CreateGmsa; Pause-Menu }
+            "0" { return }
+            default { }
+        }
+    } while ($true)
+}
+
+function Show-KerberosMenu {
+    do {
+        Show-Banner
+        Write-Host "=== KERBEROS ET DELEGATIONS ===" -ForegroundColor Cyan
+        Write-Host "--- Audit (lecture seule) ---" -ForegroundColor DarkGray
+        Write-MenuItem "1" "Rapport des delegations Kerberos (non contrainte/contrainte/RBCD)"
+        Write-MenuItem "2" "Audit AS-REP Roasting (comptes sans pre-authentification)"
+        Write-MenuItem "3" "Audit des relations d'approbation (trusts) et de leur chiffrement"
+        Write-Host "--- Remediation ---" -ForegroundColor DarkGray
+        Write-MenuItem "4" "(A VALIDER) Reinitialiser le mot de passe KRBTGT (1 des 2 executions requises)"
+        Write-MenuItem "5" "(A VALIDER) Configurer la rotation KRBTGT automatique planifiee"
+        Write-MenuItem "6" "(A VALIDER) Desactiver DES et forcer AES sur les comptes concernes"
+        Write-MenuItem "7" "(A VALIDER) Corriger l'exposition AS-REP Roasting"
+        Write-MenuItem "8" "(A VALIDER) Activer Kerberos Armoring (FAST)"
+        Write-Host " 0. Retour au menu principal"
+        Write-Host ""
+        $choice = Read-Host "Votre choix"
+        switch ($choice) {
+            "1" { Invoke-RiskyReportDelegations; Pause-Menu }
+            "2" { Invoke-Audit5AsRepRoasting; Pause-Menu }
+            "3" { Invoke-Audit5TrustsEncryption; Pause-Menu }
+            "4" { Invoke-RiskyResetKrbtgt; Pause-Menu }
+            "5" { Invoke-RiskySetupKrbtgtScheduledRotation; Pause-Menu }
+            "6" { Invoke-RiskyDisableDesForceAes; Pause-Menu }
+            "7" { Invoke-Remediate5FixAsRepRoasting; Pause-Menu }
+            "8" { Invoke-Remediate5EnableKerberosArmoring; Pause-Menu }
+            "0" { return }
+            default { }
+        }
+    } while ($true)
+}
+
+function Show-NtlmMenu {
+    do {
+        Show-Banner
+        Write-Host "=== NTLM / LM ===" -ForegroundColor Cyan
+        Write-Host "--- Audit ---" -ForegroundColor DarkGray
+        Write-MenuItem "1" "(SAFE) Activer l'audit NTLM (detection avant tout blocage)"
+        Write-MenuItem "2" "Rapport NTLMv1/LM detecte (journal Securite des DC)"
+        Write-Host "--- Remediation ---" -ForegroundColor DarkGray
+        Write-MenuItem "3" "(A VALIDER) Desactiver NTLMv1/LM (LmCompatibilityLevel) via GPO"
+        Write-MenuItem "4" "(A VALIDER) Restriction progressive de NTLM sortant (Deny avec exceptions)"
+        Write-Host " 0. Retour au menu principal"
+        Write-Host ""
+        $choice = Read-Host "Votre choix"
+        switch ($choice) {
+            "1" { Invoke-SafeEnableNtlmAudit; Pause-Menu }
+            "2" { Invoke-ReportNtlmV1Usage; Pause-Menu }
+            "3" { Invoke-RiskyDisableNtlmV1; Pause-Menu }
+            "4" { Invoke-Remediate6RestrictNtlmOutgoing; Pause-Menu }
+            "0" { return }
+            default { }
+        }
+    } while ($true)
+}
+
+function Show-SmbSysvolMenu {
+    do {
+        Show-Banner
+        Write-Host "=== SMB, SYSVOL ET NETLOGON ===" -ForegroundColor Cyan
+        Write-Host "--- Audit (lecture seule) ---" -ForegroundColor DarkGray
+        Write-MenuItem "1" "Detection de l'usage SMBv1 (active l'audit si besoin, puis lit le journal)"
+        Write-MenuItem "2" "Etat de la signature SMB (client/serveur) sur les DC"
+        Write-MenuItem "3" "Audit des partages SMB sur des postes/serveurs choisis"
+        Write-Host "--- Remediation ---" -ForegroundColor DarkGray
+        Write-MenuItem "4" "(A VALIDER) Desactiver SMBv1 (client + serveur) sur les DC"
+        Write-MenuItem "5" "(A VALIDER) Desactiver SMBv1 sur des postes/serveurs choisis"
+        Write-MenuItem "6" "(A VALIDER) Forcer la signature SMB (client + serveur) via GPO"
+        Write-MenuItem "7" "(A VALIDER) Durcir les chemins UNC SYSVOL/NETLOGON (Hardened UNC Paths)"
+        Write-Host " 0. Retour au menu principal"
+        Write-Host ""
+        $choice = Read-Host "Votre choix"
+        switch ($choice) {
+            "1" { Invoke-Audit7Smb1Usage; Pause-Menu }
+            "2" { Invoke-Audit7SmbSigningStatus; Pause-Menu }
+            "3" { Invoke-Audit7SensitiveShares; Pause-Menu }
+            "4" { Invoke-Remediate7DisableSmb1; Pause-Menu }
+            "5" { Invoke-Remediate7DisableSmb1OnComputers; Pause-Menu }
+            "6" { Invoke-Remediate7EnforceSmbSigning; Pause-Menu }
+            "7" { Invoke-Remediate7HardenedUncPaths; Pause-Menu }
+            "0" { return }
+            default { }
+        }
+    } while ($true)
+}
+
+function Show-LdapMenu {
+    do {
+        Show-Banner
+        Write-Host "=== LDAP / LDAPS ===" -ForegroundColor Cyan
+        Write-Host "--- Audit (lecture seule) ---" -ForegroundColor DarkGray
+        Write-MenuItem "1" "Audit des certificats LDAPS et joignabilite du port 636"
+        Write-MenuItem "2" "Audit des Simple Binds LDAP non signes (evenement 2887)"
+        Write-Host "--- Remediation ---" -ForegroundColor DarkGray
+        Write-MenuItem "3" "(A VALIDER) Forcer la signature LDAP / channel binding sur les DC"
+        Write-MenuItem "4" "(A VALIDER) Desactiver TLS 1.0/1.1 et activer TLS 1.2+ (SCHANNEL)"
+        Write-MenuItem "5" "(A VALIDER) Restreindre les operations LDAP anonymes (dSHeuristics)"
+        Write-Host " 0. Retour au menu principal"
+        Write-Host ""
+        $choice = Read-Host "Votre choix"
+        switch ($choice) {
+            "1" { Invoke-Audit8LdapsCertificates; Pause-Menu }
+            "2" { Invoke-Audit8LdapSimpleBinds; Pause-Menu }
+            "3" { Invoke-RiskyEnforceLdapSigning; Pause-Menu }
+            "4" { Invoke-Remediate8DisableWeakTls; Pause-Menu }
+            "5" { Invoke-Remediate8RestrictAnonymousLdap; Pause-Menu }
+            "0" { return }
+            default { }
+        }
+    } while ($true)
+}
+
+function Show-DomainControllersMenu {
+    do {
+        Show-Banner
+        Write-Host "=== CONTROLEURS DE DOMAINE ===" -ForegroundColor Cyan
+        Write-Host "--- Audit (lecture seule) ---" -ForegroundColor DarkGray
+        Write-MenuItem "1" "Rapport des hotfix installes sur les DC"
+        Write-MenuItem "2" "Etat de la synchronisation horaire (NTP)"
+        Write-MenuItem "3" "Roles et fonctionnalites installes sur les DC"
+        Write-Host "--- Remediation (SAFE) ---" -ForegroundColor DarkGray
+        Write-MenuItem "4" "(SAFE) Activer PowerShell Remoting (WinRM) sur les DC injoignables"
+        Write-MenuItem "5" "(SAFE) Desactiver le compte Invite (Guest) s'il est actif"
+        Write-MenuItem "6" "(SAFE) Proteger toutes les OU contre la suppression accidentelle"
+        Write-MenuItem "7" "(SAFE) Limiter le quota de creation d'ordinateurs (ms-DS-MachineAccountQuota = 0)"
+        Write-Host "--- Remediation (A VALIDER) ---" -ForegroundColor DarkGray
+        Write-MenuItem "8" "(A VALIDER) Arreter/desactiver le service Spooler sur les DC"
+        Write-MenuItem "9" "(A VALIDER) Configurer la source NTP externe du PDC Emulator"
+        Write-MenuItem "10" "(A VALIDER) Activer le pare-feu Windows (3 profils) sur les DC"
+        Write-Host " 0. Retour au menu principal"
+        Write-Host ""
+        Write-Host "(La signature LDAP a rejoint 'LDAP / LDAPS' ; l'audit avance et le PowerShell logging" -ForegroundColor DarkGray
+        Write-Host " ont rejoint 'Journalisation et detection'.)" -ForegroundColor DarkGray
+        $choice = Read-Host "Votre choix"
+        switch ($choice) {
+            "1"  { Invoke-ReportDCHotfixes; Pause-Menu }
+            "2"  { Invoke-Audit9TimeSyncStatus; Pause-Menu }
+            "3"  { Invoke-Audit9InstalledRoles; Pause-Menu }
+            "4"  { Invoke-SafeEnableWinRmOnDCs; Pause-Menu }
+            "5"  { Invoke-SafeDisableGuest; Pause-Menu }
+            "6"  { Invoke-SafeProtectOUs; Pause-Menu }
+            "7"  { Invoke-SafeSetMachineAccountQuotaZero; Pause-Menu }
             "8"  { Invoke-RiskyDisableSpoolerOnDCs; Pause-Menu }
-            "9"  { Invoke-RiskyEnforceLdapSigning; Pause-Menu }
-            "10" { Invoke-RiskyDisableLLMNR; Pause-Menu }
-            "11" { Invoke-RiskyDisableInactiveAccounts; Pause-Menu }
-            "12" { Invoke-RiskyForcePasswordExpirationPrivileged; Pause-Menu }
-            "13" { Invoke-RiskySetupKrbtgtScheduledRotation; Pause-Menu }
-            "14" { Invoke-RiskyDisableByDate; Pause-Menu }
-            "0"  { return }
+            "9"  { Invoke-Remediate9ConfigurePdcTimeSource; Pause-Menu }
+            "10" { Invoke-Remediate9EnableFirewallBaseline; Pause-Menu }
+            "0" { return }
+            default { }
+        }
+    } while ($true)
+}
+
+function Show-LapsMenu {
+    do {
+        Show-Banner
+        Write-Host "=== WINDOWS LAPS ===" -ForegroundColor Cyan
+        Write-Host "--- Audit (lecture seule) ---" -ForegroundColor DarkGray
+        Write-MenuItem "1" "Etat du deploiement LAPS (schema, couverture)"
+        Write-MenuItem "2" "Audit des droits de lecture/reset du mot de passe LAPS"
+        Write-Host "--- Remediation ---" -ForegroundColor DarkGray
+        Write-MenuItem "3" "(A VALIDER) Preparer le schema Active Directory pour LAPS"
+        Write-MenuItem "4" "(A VALIDER) Deployer la GPO Windows LAPS"
+        Write-MenuItem "5" "(A VALIDER) Configurer les droits de lecture/reset LAPS"
+        Write-Host " 0. Retour au menu principal"
+        Write-Host ""
+        $choice = Read-Host "Votre choix"
+        switch ($choice) {
+            "1" { Invoke-Audit10LapsDeployment; Pause-Menu }
+            "2" { Invoke-Audit10LapsPermissions; Pause-Menu }
+            "3" { Invoke-Remediate10PrepareSchema; Pause-Menu }
+            "4" { Invoke-Remediate10DeployGpo; Pause-Menu }
+            "5" { Invoke-Remediate10SetPermissions; Pause-Menu }
+            "0" { return }
+            default { }
+        }
+    } while ($true)
+}
+
+function Show-PasswordAuthMenu {
+    do {
+        Show-Banner
+        Write-Host "=== MOTS DE PASSE ET AUTHENTIFICATION ===" -ForegroundColor Cyan
+        Write-Host "--- Audit (lecture seule) ---" -ForegroundColor DarkGray
+        Write-MenuItem "1" "Rapport des comptes avec mot de passe n'expirant jamais"
+        Write-MenuItem "2" "Audit de la politique de mot de passe par defaut du domaine"
+        Write-Host "--- Remediation ---" -ForegroundColor DarkGray
+        Write-MenuItem "3" "(SAFE) Retirer le flag 'Mot de passe non requis' sur les comptes concernes"
+        Write-MenuItem "4" "(A VALIDER) Corriger la politique de mot de passe par defaut du domaine"
+        Write-MenuItem "5" "(A VALIDER) Creer une Fine-Grained Password Policy pour les comptes de service"
+        Write-MenuItem "6" "(SAFE) Generer les recommandations MFA / Conditional Access (hybride)"
+        Write-Host " 0. Retour au menu principal"
+        Write-Host ""
+        $choice = Read-Host "Votre choix"
+        switch ($choice) {
+            "1" { Invoke-ReportPasswordNeverExpires; Pause-Menu }
+            "2" { Invoke-Audit11DefaultPasswordPolicy; Pause-Menu }
+            "3" { Invoke-SafeClearPasswordNotRequired; Pause-Menu }
+            "4" { Invoke-Remediate11HardenDefaultPasswordPolicy; Pause-Menu }
+            "5" { Invoke-Remediate11CreateServiceAccountFGPP; Pause-Menu }
+            "6" { Invoke-Remediate11GenerateMfaRecommendations; Pause-Menu }
+            "0" { return }
+            default { }
+        }
+    } while ($true)
+}
+
+function Show-NetworkAntiRelayMenu {
+    do {
+        Show-Banner
+        Write-Host "=== RESEAU ET ANTI-RELAY ===" -ForegroundColor Cyan
+        Write-Host "--- Audit (lecture seule) ---" -ForegroundColor DarkGray
+        Write-MenuItem "1" "Audit de la Global Query Block List DNS (WPAD/ISATAP)"
+        Write-MenuItem "2" "Audit des ports/services exposes sur les DC"
+        Write-Host "--- Remediation ---" -ForegroundColor DarkGray
+        Write-MenuItem "3" "(A VALIDER) Desactiver LLMNR via GPO (domaine entier)"
+        Write-MenuItem "4" "(SAFE) Retablir la Global Query Block List (wpad/isatap)"
+        Write-MenuItem "5" "(A VALIDER) Desactiver NetBIOS sur TCP/IP sur des machines choisies"
+        Write-MenuItem "6" "(A VALIDER) Durcir RPC (clients non authentifies, resolution du mappeur)"
+        Write-MenuItem "7" "(A VALIDER) Durcir WinRM (authentification Basic desactivee, trafic chiffre)"
+        Write-MenuItem "8" "(A VALIDER) Restreindre l'enumeration distante SAM/SAMR"
+        Write-Host " 0. Retour au menu principal"
+        Write-Host ""
+        $choice = Read-Host "Votre choix"
+        switch ($choice) {
+            "1" { Invoke-Audit14GlobalQueryBlockList; Pause-Menu }
+            "2" { Invoke-Audit14ExposedServices; Pause-Menu }
+            "3" { Invoke-RiskyDisableLLMNR; Pause-Menu }
+            "4" { Invoke-Remediate14RestoreGlobalQueryBlockList; Pause-Menu }
+            "5" { Invoke-Remediate14DisableNetbiosOnComputers; Pause-Menu }
+            "6" { Invoke-Remediate14RestrictRpc; Pause-Menu }
+            "7" { Invoke-Remediate14RestrictWinRm; Pause-Menu }
+            "8" { Invoke-Remediate14RestrictSamEnumeration; Pause-Menu }
+            "0" { return }
+            default { }
+        }
+    } while ($true)
+}
+
+function Show-GpoBaselineMenu {
+    do {
+        Show-Banner
+        Write-Host "=== GPO DE DURCISSEMENT (SOCLE GPO-SEC-*) ===" -ForegroundColor Cyan
+        Write-Host "--- Audit (lecture seule) ---" -ForegroundColor DarkGray
+        Write-MenuItem "1" "Etat du socle GPO-SEC-* et des sauvegardes de GPO"
+        Write-Host "--- Remediation ---" -ForegroundColor DarkGray
+        Write-MenuItem "2" "(SAFE) Sauvegarder TOUTES les GPO du domaine"
+        Write-MenuItem "3" "(SAFE) Creer les GPO manquantes du socle GPO-SEC-* (non liees)"
+        Write-Host " 0. Retour au menu principal"
+        Write-Host ""
+        $choice = Read-Host "Votre choix"
+        switch ($choice) {
+            "1" { Invoke-Audit12GpoBaselineStatus; Pause-Menu }
+            "2" { Invoke-Remediate12BackupAllGpos; Pause-Menu }
+            "3" { Invoke-Remediate12CreateBaselineGpoShells; Pause-Menu }
+            "0" { return }
+            default { }
+        }
+    } while ($true)
+}
+
+function Show-WorkstationsServersMenu {
+    do {
+        Show-Banner
+        Write-Host "=== POSTES ET SERVEURS MEMBRES ===" -ForegroundColor Cyan
+        Write-Host "--- Audit (lecture seule) ---" -ForegroundColor DarkGray
+        Write-MenuItem "1" "Etat de Microsoft Defender sur des machines choisies"
+        Write-MenuItem "2" "Audit des administrateurs locaux sur des machines choisies"
+        Write-Host "--- Remediation ---" -ForegroundColor DarkGray
+        Write-MenuItem "3" "(A VALIDER) Renforcer Microsoft Defender via GPO (Cloud/Reseau/SmartScreen/ASR)"
+        Write-MenuItem "4" "(A VALIDER) Restreindre RDP via GPO (NLA obligatoire)"
+        Write-MenuItem "5" "(A VALIDER) Retirer des comptes des administrateurs locaux"
+        Write-MenuItem "6" "(SAFE) Etendre la journalisation PowerShell aux postes/serveurs choisis"
+        Write-MenuItem "7" "(A VALIDER) Bloquer les scripts .vbs/.js (Windows Script Host)"
+        Write-MenuItem "8" "(A VALIDER) Activer le pare-feu Windows (3 profils)"
+        Write-Host " 0. Retour au menu principal"
+        Write-Host ""
+        $choice = Read-Host "Votre choix"
+        switch ($choice) {
+            "1" { Invoke-Audit13DefenderStatus; Pause-Menu }
+            "2" { Invoke-Audit13LocalAdmins; Pause-Menu }
+            "3" { Invoke-Remediate13EnableDefenderProtections; Pause-Menu }
+            "4" { Invoke-Remediate13RestrictRdp; Pause-Menu }
+            "5" { Invoke-Remediate13CleanupLocalAdmins; Pause-Menu }
+            "6" { Invoke-Remediate13EnablePowerShellLoggingExtended; Pause-Menu }
+            "7" { Invoke-Remediate13DisableWindowsScriptHost; Pause-Menu }
+            "8" { Invoke-Remediate13EnableFirewallBaseline; Pause-Menu }
+            "0" { return }
+            default { }
+        }
+    } while ($true)
+}
+
+function Show-BackupResilienceMenu {
+    do {
+        Show-Banner
+        Write-Host "=== SAUVEGARDE ET RESILIENCE AD ===" -ForegroundColor Cyan
+        Write-Host "--- Audit (lecture seule) ---" -ForegroundColor DarkGray
+        Write-MenuItem "1" "Etat des sauvegardes System State sur les DC"
+        Write-Host "--- Remediation ---" -ForegroundColor DarkGray
+        Write-MenuItem "2" "(SAFE) Activer la Corbeille Active Directory"
+        Write-MenuItem "3" "(A VALIDER) Planifier une sauvegarde System State quotidienne"
+        Write-MenuItem "4" "(SAFE) Generer les procedures de recuperation (objet / DC / foret)"
+        Write-Host " 0. Retour au menu principal"
+        Write-Host ""
+        $choice = Read-Host "Votre choix"
+        switch ($choice) {
+            "1" { Invoke-Audit17SystemStateBackupStatus; Pause-Menu }
+            "2" { Invoke-SafeEnableRecycleBin; Pause-Menu }
+            "3" { Invoke-Remediate17ScheduleSystemStateBackup; Pause-Menu }
+            "4" { Invoke-Remediate17GenerateRecoveryProcedures; Pause-Menu }
+            "0" { return }
+            default { }
+        }
+    } while ($true)
+}
+
+function Show-ObsolescenceMenu {
+    do {
+        Show-Banner
+        Write-Host "=== OBSOLESCENCE ===" -ForegroundColor Cyan
+        Write-Host "--- Audit (lecture seule) ---" -ForegroundColor DarkGray
+        Write-MenuItem "1" "Inventaire des systemes d'exploitation non/bientot non supportes"
+        Write-MenuItem "2" "Protocoles obsoletes actifs sur des machines choisies (SMBv1, TLS 1.0/1.1)"
+        Write-Host "--- Remediation / outillage ---" -ForegroundColor DarkGray
+        Write-MenuItem "3" "(SAFE) Generer le plan de traitement de l'obsolescence (consolide)"
+        Write-Host " 0. Retour au menu principal"
+        Write-Host ""
+        Write-Host "(Les migrations lourdes elles-memes sont hors perimetre de ce script.)" -ForegroundColor DarkGray
+        $choice = Read-Host "Votre choix"
+        switch ($choice) {
+            "1" { Invoke-Audit18UnsupportedOS; Pause-Menu }
+            "2" { Invoke-Audit18LegacyProtocolsOnComputers; Pause-Menu }
+            "3" { Invoke-Remediate18GenerateTreatmentPlan; Pause-Menu }
+            "0" { return }
+            default { }
+        }
+    } while ($true)
+}
+
+function Show-LoggingDetectionMenu {
+    do {
+        Show-Banner
+        Write-Host "=== JOURNALISATION ET DETECTION ===" -ForegroundColor Cyan
+        Write-Host "--- Audit (lecture seule) ---" -ForegroundColor DarkGray
+        Write-MenuItem "1" "Audit du SACL sur les objets sensibles (racine du domaine, AdminSDHolder)"
+        Write-Host "--- Remediation (SAFE) ---" -ForegroundColor DarkGray
+        Write-MenuItem "2" "(SAFE) Activer l'audit avance sur les DC (auditpol)"
+        Write-MenuItem "3" "(SAFE) Activer la journalisation PowerShell (Script Block Logging)"
+        Write-Host "--- Remediation (A VALIDER) ---" -ForegroundColor DarkGray
+        Write-MenuItem "4" "(A VALIDER) Configurer l'audit SACL sur les objets sensibles"
+        Write-MenuItem "5" "(A VALIDER) Configurer la redirection des journaux vers un collecteur (WEF/SIEM)"
+        Write-Host " 0. Retour au menu principal"
+        Write-Host ""
+        $choice = Read-Host "Votre choix"
+        switch ($choice) {
+            "1" { Invoke-Audit19ObjectAuditingStatus; Pause-Menu }
+            "2" { Invoke-SafeEnableDCAuditPolicy; Pause-Menu }
+            "3" { Invoke-SafeEnablePowerShellLogging; Pause-Menu }
+            "4" { Invoke-Remediate19ConfigureObjectAuditing; Pause-Menu }
+            "5" { Invoke-Remediate19ConfigureEventForwarding; Pause-Menu }
+            "0" { return }
+            default { }
+        }
+    } while ($true)
+}
+
+function Show-FinalControlMenu {
+    do {
+        Show-Banner
+        Write-Host "=== CONTROLE FINAL ===" -ForegroundColor Cyan
+        Write-Host "--- Audit (lecture seule) ---" -ForegroundColor DarkGray
+        Write-MenuItem "1" "Lancer le controle final consolide (rejoue les audits cles de plusieurs themes)"
+        Write-Host "--- Remediation / outillage ---" -ForegroundColor DarkGray
+        Write-MenuItem "2" "(SAFE) Initialiser/completer le registre des exceptions"
+        Write-Host " 0. Retour au menu principal"
+        Write-Host ""
+        Write-Host "(Ne remplace pas l'outil separe de comparaison PingCastle avant/apres.)" -ForegroundColor DarkGray
+        $choice = Read-Host "Votre choix"
+        switch ($choice) {
+            "1" { Invoke-Audit20FinalControlReport; Pause-Menu }
+            "2" { Invoke-Remediate20InitExceptionsRegister; Pause-Menu }
+            "0" { return }
             default { }
         }
     } while ($true)
@@ -2127,43 +5285,41 @@ function Show-RiskyMenu {
 function Show-ReportMenu {
     do {
         Show-Banner
-        Write-Host "=== [3] RAPPORTS - lecture seule, aucune modification ===" -ForegroundColor Magenta
-        Write-Host " 1. Export comptes inactifs (utilisateurs/ordinateurs)"
-        Write-Host " 2. Export comptes avec mot de passe n'expirant jamais"
-        Write-Host " 3. Export membres des groupes a privileges"
-        Write-Host " 4. Export hotfix des controleurs de domaine"
-        Write-Host " 5. Rapport NTLMv1/LM detecte (necessite l'audit NTLM actif, peut etre long)"
-        Write-Host " 6. Export global (rapports rapides, hors NTLMv1/LM)"
+        Write-Host "=== RAPPORTS TRANSVERSES - lecture seule, aucune modification ===" -ForegroundColor Magenta
+        Write-MenuItem "1" "Export comptes inactifs (utilisateurs/ordinateurs)"
+        Write-MenuItem "2" "Export global (rapports rapides multi-themes)"
         Write-Host " 0. Retour au menu principal"
         Write-Host ""
         $choice = Read-Host "Votre choix"
         switch ($choice) {
             "1" { Invoke-ReportInactiveAccounts; Pause-Menu }
-            "2" { Invoke-ReportPasswordNeverExpires; Pause-Menu }
-            "3" { Invoke-ReportPrivilegedGroups; Pause-Menu }
-            "4" { Invoke-ReportDCHotfixes; Pause-Menu }
-            "5" { Invoke-ReportNtlmV1Usage; Pause-Menu }
-            "6" { Invoke-ReportAll; Pause-Menu }
+            "2" { Invoke-ReportAll; Pause-Menu }
             "0" { return }
             default { }
         }
     } while ($true)
 }
 
-function Show-AutomationMenu {
+function Show-InactiveAccountsAutomationMenu {
     do {
         Show-Banner
-        Write-Host "=== [4] AUTOMATISATION - taches planifiees ===" -ForegroundColor Red
-        Write-Host " 1. Configurer la tache planifiee de desactivation automatique (postes/utilisateurs)"
-        Write-Host " 2. Afficher l'etat de la tache planifiee existante"
-        Write-Host " 3. Supprimer la tache planifiee"
+        Write-Host "=== HYGIENE DES COMPTES INACTIFS ET AUTOMATISATION ===" -ForegroundColor Cyan
+        Write-Host "--- Remediation manuelle ---" -ForegroundColor DarkGray
+        Write-MenuItem "1" "(A VALIDER) Desactiver les comptes inactifs par anciennete (quarantaine)"
+        Write-MenuItem "2" "(A VALIDER) Desactiver postes/utilisateurs a partir d'une DATE choisie"
+        Write-Host "--- Automatisation (tache planifiee) ---" -ForegroundColor DarkGray
+        Write-MenuItem "3" "Configurer la tache planifiee de desactivation automatique"
+        Write-MenuItem "4" "Afficher l'etat de la tache planifiee existante"
+        Write-MenuItem "5" "Supprimer la tache planifiee"
         Write-Host " 0. Retour au menu principal"
         Write-Host ""
         $choice = Read-Host "Votre choix"
         switch ($choice) {
-            "1" { Invoke-AutomationSetupScheduledTask; Pause-Menu }
-            "2" { Invoke-AutomationShowStatus; Pause-Menu }
-            "3" { Invoke-AutomationRemoveScheduledTask; Pause-Menu }
+            "1" { Invoke-RiskyDisableInactiveAccounts; Pause-Menu }
+            "2" { Invoke-RiskyDisableByDate; Pause-Menu }
+            "3" { Invoke-AutomationSetupScheduledTask; Pause-Menu }
+            "4" { Invoke-AutomationShowStatus; Pause-Menu }
+            "5" { Invoke-AutomationRemoveScheduledTask; Pause-Menu }
             "0" { return }
             default { }
         }
@@ -2174,21 +5330,60 @@ function Show-MainMenu {
     do {
         Show-Banner
         Write-Host "MENU PRINCIPAL" -ForegroundColor White
-        Write-Host " [1] Actions SAFE (aucune incidence prod)" -ForegroundColor Green
-        Write-Host " [2] Actions A VALIDER (impact potentiel)" -ForegroundColor Red
-        Write-Host " [3] Rapports (lecture seule)" -ForegroundColor Magenta
-        Write-Host " [4] Automatisation (taches planifiees)" -ForegroundColor Red
+
+        Write-MenuCategory "Identite et comptes"
+        Write-MenuItem "1" "Comptes a privileges" -Color Cyan
+        Write-MenuItem "2" "Comptes de service" -Color Cyan
+        Write-MenuItem "9" "Mots de passe et authentification" -Color Cyan
+
+        Write-MenuCategory "Authentification et protocoles"
+        Write-MenuItem "3" "Kerberos et delegations" -Color Cyan
+        Write-MenuItem "4" "NTLM / LM" -Color Cyan
+        Write-MenuItem "5" "SMB, SYSVOL et NETLOGON" -Color Cyan
+        Write-MenuItem "6" "LDAP / LDAPS" -Color Cyan
+
+        Write-MenuCategory "Infrastructure"
+        Write-MenuItem "7"  "Controleurs de domaine" -Color Cyan
+        Write-MenuItem "8"  "Windows LAPS" -Color Cyan
+        Write-MenuItem "10" "GPO de durcissement (socle GPO-SEC-*)" -Color Cyan
+        Write-MenuItem "11" "Postes et serveurs membres" -Color Cyan
+        Write-MenuItem "12" "Reseau et anti-relay" -Color Cyan
+
+        Write-MenuCategory "Resilience et pilotage"
+        Write-MenuItem "13" "Sauvegarde et resilience AD" -Color Cyan
+        Write-MenuItem "14" "Obsolescence" -Color Cyan
+        Write-MenuItem "15" "Journalisation et detection" -Color Cyan
+        Write-MenuItem "16" "Controle final" -Color Cyan
+        Write-MenuItem "17" "Rapports transverses (export global)" -Color Magenta
+        Write-MenuItem "18" "Hygiene des comptes inactifs et automatisation" -Color Cyan
+
         Write-Host ""
+        Write-Host " [R] Rechercher une action par mot-cle" -ForegroundColor DarkCyan
         $modeLabel = if ($Script:SimulationMode) { "Activer le mode REEL (desactiver la simulation)" } else { "Repasser en mode SIMULATION" }
         Write-Host (" [S] {0}" -f $modeLabel) -ForegroundColor Yellow
         Write-Host " [Q] Quitter"
         Write-Host ""
         $choice = Read-Host "Votre choix"
         switch ($choice.ToUpper()) {
-            "1" { Show-SafeMenu }
-            "2" { Show-RiskyMenu }
-            "3" { Show-ReportMenu }
-            "4" { Show-AutomationMenu }
+            "1"  { Show-PrivilegedAccountsMenu }
+            "2"  { Show-ServiceAccountsMenu }
+            "3"  { Show-KerberosMenu }
+            "4"  { Show-NtlmMenu }
+            "5"  { Show-SmbSysvolMenu }
+            "6"  { Show-LdapMenu }
+            "7"  { Show-DomainControllersMenu }
+            "8"  { Show-LapsMenu }
+            "9"  { Show-PasswordAuthMenu }
+            "10" { Show-GpoBaselineMenu }
+            "11" { Show-WorkstationsServersMenu }
+            "12" { Show-NetworkAntiRelayMenu }
+            "13" { Show-BackupResilienceMenu }
+            "14" { Show-ObsolescenceMenu }
+            "15" { Show-LoggingDetectionMenu }
+            "16" { Show-FinalControlMenu }
+            "17" { Show-ReportMenu }
+            "18" { Show-InactiveAccountsAutomationMenu }
+            "R" { Invoke-SearchActions; Pause-Menu }
             "S" {
                 if ($Script:SimulationMode) {
                     Write-Host ""

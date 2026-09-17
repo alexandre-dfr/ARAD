@@ -1,0 +1,6 @@
+﻿[2026-09-17 15:23:27] [INFO] Demarrage du script de remediation AD.
+[2026-09-17 15:23:27] [ERROR] Le module ActiveDirectory (RSAT) est introuvable. Installez les RSAT AD DS avant de continuer.
+[2026-09-17 15:23:27] [ERROR] Impossible de contacter le domaine Active Directory. Verifiez la connectivite / les droits.
+[2026-09-17 15:23:27] [WARN] Le compte courant (ADD-ON\adu) ne semble pas etre membre (direct/indirect) de 'Domain Admins'. Certaines actions echoueront.
+[2026-09-17 15:23:27] [WARN] La console n'est pas lancee en tant qu'Administrateur local. Relancez PowerShell en 'Executer en tant qu'administrateur'.
+[2026-09-17 15:23:27] [ERROR] Prerequis non satisfaits. Corrigez les points ci-dessus avant de continuer.
