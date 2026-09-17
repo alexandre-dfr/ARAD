@@ -777,12 +777,12 @@ function Invoke-Remediate11CreateServiceAccountFGPP {
     $lengthInput = Read-Host "Longueur minimale du mot de passe pour ce groupe [defaut 24]"
     $length = if ($lengthInput -match '^\d+$') { [int]$lengthInput } else { 24 }
 
-    $policyName = "PSO-ComptesDeService"
+    $policyName = "SEC-PSO-ComptesDeService"
     if (-not (Confirm-Action ("Creer la FGPP '{0}' (longueur min {1}) et l'appliquer au groupe '{2}'" -f $policyName, $length, $groupName) -Strong)) { return }
 
     Invoke-Guarded -Description ("Creation du groupe {0} (si absent)" -f $groupName) -Action {
         if (-not (Get-ADGroup -Filter "Name -eq '$groupName'" -ErrorAction SilentlyContinue)) {
-            New-ADGroup -Name $groupName -GroupScope Global -GroupCategory Security -Description "Comptes de service - FGPP dediee (ADHC)"
+            New-ADGroup -Name $groupName -GroupScope Global -GroupCategory Security -Description "Comptes de service - FGPP dediee (SEC)"
         }
     }
 
@@ -873,8 +873,8 @@ function Invoke-SafeEnableWinRmViaGPO {
         # sans passer par le DC lui-meme.
         try {
             $gpoSession = Open-NetGPO -PolicyStore ("{0}\{1}" -f (Get-ADDomain).DNSRoot, $gpoName) -ErrorAction Stop
-            if (-not (Get-NetFirewallRule -GPOSession $gpoSession -Name "ADHC-WINRM-HTTP-In-TCP" -ErrorAction SilentlyContinue)) {
-                New-NetFirewallRule -GPOSession $gpoSession -Name "ADHC-WINRM-HTTP-In-TCP" -DisplayName "Windows Remote Management (HTTP-In) - ADHC" -Direction Inbound -Protocol TCP -LocalPort 5985 -Action Allow -Profile Domain, Private -Enabled True | Out-Null
+            if (-not (Get-NetFirewallRule -GPOSession $gpoSession -Name "SEC-WINRM-HTTP-In-TCP" -ErrorAction SilentlyContinue)) {
+                New-NetFirewallRule -GPOSession $gpoSession -Name "SEC-WINRM-HTTP-In-TCP" -DisplayName "Windows Remote Management (HTTP-In) - SEC" -Direction Inbound -Protocol TCP -LocalPort 5985 -Action Allow -Profile Domain, Private -Enabled True | Out-Null
             }
             Save-NetGPO -GPOSession $gpoSession
         } catch {
@@ -1061,17 +1061,17 @@ function Get-KrbtgtRotationScriptContent {
 # Deploye et execute automatiquement par la tache planifiee "SEC - Rotation KRBTGT".
 # Ne PAS executer manuellement sans avoir verifie l'etat de replication AD au prealable.
 
-$logFile = "C:\ADHC-Scripts\Krbtgt-Rotation.log"
+$logFile = "C:\SEC-Scripts\Krbtgt-Rotation.log"
 
 function Write-RotLog {
     param([string]$Message)
     $line = "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
     Add-Content -Path $logFile -Value $line -Encoding UTF8
     try {
-        if (-not [System.Diagnostics.EventLog]::SourceExists("ADHC-KrbtgtRotation")) {
-            New-EventLog -LogName Application -Source "ADHC-KrbtgtRotation" -ErrorAction SilentlyContinue
+        if (-not [System.Diagnostics.EventLog]::SourceExists("SEC-KrbtgtRotation")) {
+            New-EventLog -LogName Application -Source "SEC-KrbtgtRotation" -ErrorAction SilentlyContinue
         }
-        Write-EventLog -LogName Application -Source "ADHC-KrbtgtRotation" -EventId 1000 -EntryType Information -Message $Message -ErrorAction SilentlyContinue
+        Write-EventLog -LogName Application -Source "SEC-KrbtgtRotation" -EventId 1000 -EntryType Information -Message $Message -ErrorAction SilentlyContinue
     } catch { }
 }
 
@@ -1187,7 +1187,7 @@ function Invoke-RiskySetupKrbtgtScheduledRotation {
         $scriptContent = Get-KrbtgtRotationScriptContent
         Invoke-Command -ComputerName $targetDC -ScriptBlock {
             param($content)
-            $dir = "C:\ADHC-Scripts"
+            $dir = "C:\SEC-Scripts"
             if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
             Set-Content -Path (Join-Path $dir "Reset-KrbtgtScheduled.ps1") -Value $content -Encoding UTF8
         } -ArgumentList $scriptContent -ErrorAction Stop
@@ -1197,7 +1197,7 @@ function Invoke-RiskySetupKrbtgtScheduledRotation {
         Invoke-Command -ComputerName $targetDC -ScriptBlock {
             param($gmsaSam, $domainNetbios, $intervalDays)
             $taskName = "SEC - Rotation KRBTGT"
-            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument '-NoProfile -ExecutionPolicy Bypass -File "C:\ADHC-Scripts\Reset-KrbtgtScheduled.ps1"'
+            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument '-NoProfile -ExecutionPolicy Bypass -File "C:\SEC-Scripts\Reset-KrbtgtScheduled.ps1"'
             $trigger = New-ScheduledTaskTrigger -Daily -DaysInterval $intervalDays -At "02:00"
             $principal = New-ScheduledTaskPrincipal -UserId "$domainNetbios\$gmsaSam`$" -LogonType Password -RunLevel Highest
             $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd
@@ -1208,7 +1208,7 @@ function Invoke-RiskySetupKrbtgtScheduledRotation {
     }
 
     Write-Log ("Tache planifiee 'SEC - Rotation KRBTGT' creee sur {0}, execution tous les {1} jours a 02:00, sous le compte {2}\{3}$." -f $targetDC, $days, $domainNetbios, $gmsaName) -Level OK
-    Write-Log "Journal local sur le DC : C:\ADHC-Scripts\Krbtgt-Rotation.log (+ journal d'evenements Application, source ADHC-KrbtgtRotation)." -Level INFO
+    Write-Log "Journal local sur le DC : C:\SEC-Scripts\Krbtgt-Rotation.log (+ journal d'evenements Application, source SEC-KrbtgtRotation)." -Level INFO
     Write-Log "Chaque execution verifie l'etat de la replication AD (repadmin /replsummary) avant d'agir : en cas d'anomalie, la rotation est annulee automatiquement." -Level INFO
 }
 
@@ -2737,7 +2737,7 @@ function Invoke-Remediate4DenyInteractiveLogon {
 
     Invoke-Guarded -Description ("Creation/verification du groupe {0}" -f $groupName) -Action {
         if (-not (Get-ADGroup -Filter "Name -eq '$groupName'" -ErrorAction SilentlyContinue)) {
-            New-ADGroup -Name $groupName -GroupScope Global -GroupCategory Security -Description "Comptes de service - connexion interactive/RDP interdite (ADHC)"
+            New-ADGroup -Name $groupName -GroupScope Global -GroupCategory Security -Description "Comptes de service - connexion interactive/RDP interdite (SEC)"
         }
         Add-ADGroupMember -Identity $groupName -Members ($selected | Select-Object -ExpandProperty SID) -ErrorAction SilentlyContinue
     }
@@ -4318,17 +4318,17 @@ function Get-DisableByDateScheduledScriptContent {
 # Deploye et execute automatiquement par la tache planifiee "SEC - Desactivation Auto (date/anciennete)".
 # Ne PAS executer manuellement sans avoir revu les parametres et exclusions ci-dessus.
 
-$logFile = "C:\ADHC-Scripts\Disable-ByDate.log"
+$logFile = "C:\SEC-Scripts\Disable-ByDate.log"
 
 function Write-DisLog {
     param([string]$Message)
     $line = "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
     Add-Content -Path $logFile -Value $line -Encoding UTF8
     try {
-        if (-not [System.Diagnostics.EventLog]::SourceExists("ADHC-AutoDisable")) {
-            New-EventLog -LogName Application -Source "ADHC-AutoDisable" -ErrorAction SilentlyContinue
+        if (-not [System.Diagnostics.EventLog]::SourceExists("SEC-AutoDisable")) {
+            New-EventLog -LogName Application -Source "SEC-AutoDisable" -ErrorAction SilentlyContinue
         }
-        Write-EventLog -LogName Application -Source "ADHC-AutoDisable" -EventId 2000 -EntryType Information -Message $Message -ErrorAction SilentlyContinue
+        Write-EventLog -LogName Application -Source "SEC-AutoDisable" -EventId 2000 -EntryType Information -Message $Message -ErrorAction SilentlyContinue
     } catch { }
 }
 
@@ -4584,7 +4584,7 @@ function Invoke-AutomationSetupScheduledTask {
             -DisableUserOUName $Script:DisableUserOUName -DisableComputerOUName $Script:DisableComputerOUName
         Invoke-Command -ComputerName $targetDC -ScriptBlock {
             param($content)
-            $dir = "C:\ADHC-Scripts"
+            $dir = "C:\SEC-Scripts"
             if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
             Set-Content -Path (Join-Path $dir "Disable-ByDate.ps1") -Value $content -Encoding UTF8
         } -ArgumentList $scriptContent -ErrorAction Stop
@@ -4594,7 +4594,7 @@ function Invoke-AutomationSetupScheduledTask {
         Invoke-Command -ComputerName $targetDC -ScriptBlock {
             param($gmsaSam, $domainNetbios, $intervalDays)
             $taskName = "SEC - Desactivation Auto (date/anciennete)"
-            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument '-NoProfile -ExecutionPolicy Bypass -File "C:\ADHC-Scripts\Disable-ByDate.ps1"'
+            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument '-NoProfile -ExecutionPolicy Bypass -File "C:\SEC-Scripts\Disable-ByDate.ps1"'
             $trigger = New-ScheduledTaskTrigger -Daily -DaysInterval $intervalDays -At "03:00"
             $principal = New-ScheduledTaskPrincipal -UserId "$domainNetbios\$gmsaSam`$" -LogonType Password -RunLevel Highest
             $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd
@@ -4605,7 +4605,7 @@ function Invoke-AutomationSetupScheduledTask {
     }
 
     Write-Log ("Tache planifiee 'SEC - Desactivation Auto (date/anciennete)' creee sur {0}, execution tous les {1} jours a 03:00, sous le compte {2}\{3}$." -f $targetDC, $daysInterval, $domainNetbios, $gmsaName) -Level OK
-    Write-Log "Journal local sur le DC : C:\ADHC-Scripts\Disable-ByDate.log (+ journal d'evenements Application, source ADHC-AutoDisable)." -Level INFO
+    Write-Log "Journal local sur le DC : C:\SEC-Scripts\Disable-ByDate.log (+ journal d'evenements Application, source SEC-AutoDisable)." -Level INFO
     Write-Log "Pour changer les seuils/exclusions, relancez cette configuration : elle regenere et remplace le script deploye et la tache." -Level INFO
 }
 
