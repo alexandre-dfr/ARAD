@@ -257,6 +257,43 @@ function Test-DCWinRmConnectivity {
     return [PSCustomObject]@{ Reachable = $reachable; Unreachable = $unreachable }
 }
 
+function Test-IsLocalComputer {
+    <#
+        Compare le nom court d'un hote (avant le premier '.') au nom NetBIOS de la
+        machine locale, pour detecter quand une action ciblant un DC vise en fait
+        la machine sur laquelle le script s'execute.
+    #>
+    param([Parameter(Mandatory)][string]$ComputerName)
+    return ($ComputerName.Split('.')[0] -ieq $env:COMPUTERNAME)
+}
+
+function Invoke-OnDC {
+    <#
+        Remplace Invoke-Command -ComputerName pour toutes les actions sur DC : si la
+        cible est la machine locale, execute le scriptblock EN LOCAL (sans WinRM) au
+        lieu de faire un Invoke-Command -ComputerName vers soi-meme. Ce self-remoting
+        echoue frequemment avec "Acces refuse" meme pour un compte Domain Admin
+        (comportement WinRM connu lie au loopback), alors que le remoting vers un
+        AUTRE DC fonctionne normalement. Transparent pour l'appelant : memes
+        parametres qu'Invoke-Command (ScriptBlock, ArgumentList, ErrorAction).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ComputerName,
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [object[]]$ArgumentList
+    )
+    $params = @{ ScriptBlock = $ScriptBlock }
+    if ($PSBoundParameters.ContainsKey('ArgumentList')) { $params['ArgumentList'] = $ArgumentList }
+    if ($PSBoundParameters.ContainsKey('ErrorAction'))  { $params['ErrorAction']  = $PSBoundParameters['ErrorAction'] }
+
+    if (Test-IsLocalComputer -ComputerName $ComputerName) {
+        Invoke-Command @params
+    } else {
+        Invoke-Command @params -ComputerName $ComputerName
+    }
+}
+
 function Add-DisabledMarkerToDescription {
     <#
         Ajoute (sans ecraser une description existante) la mention "Desactive le :
@@ -604,7 +641,7 @@ function Invoke-SafeEnableDCAuditPolicy {
 
     foreach ($dc in $dcs) {
         Invoke-Guarded -Description ("auditpol /set sur {0}" -f $dc.HostName) -Action {
-            $results = Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+            $results = Invoke-OnDC -ComputerName $dc.HostName -ScriptBlock {
                 param($cats)
                 foreach ($c in $cats) {
                     $null = & auditpol.exe /set /subcategory:"$($c.Guid)" /success:enable /failure:enable 2>&1
@@ -645,7 +682,7 @@ function Invoke-SafeEnableNtlmAudit {
 
     foreach ($dc in $dcs) {
         Invoke-Guarded -Description ("Activation de l'audit NTLM sur {0}" -f $dc.HostName) -Action {
-            Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+            Invoke-OnDC -ComputerName $dc.HostName -ScriptBlock {
                 New-Item -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0" -Force -ErrorAction SilentlyContinue | Out-Null
                 # AuditReceivingNTLMTraffic = 2 -> journalise le NTLM RECU pour tous les comptes (audit uniquement, jamais bloquant)
                 Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0" -Name "AuditReceivingNTLMTraffic" -Value 2 -Type DWord
@@ -1046,7 +1083,7 @@ function Grant-KrbtgtResetPermission {
     $domainNetbios = (Get-ADDomain).NetBIOSName
 
     Invoke-Guarded -Description ("Delegation du droit 'Reset Password' sur krbtgt a {0}" -f $PrincipalSam) -Action {
-        Invoke-Command -ComputerName $TargetDC -ScriptBlock {
+        Invoke-OnDC -ComputerName $TargetDC -ScriptBlock {
             param($dn, $account)
             & dsacls.exe "$dn" /G "${account}:CA;Reset Password" | Out-Null
         } -ArgumentList $krbtgtDN, "$domainNetbios\$PrincipalSam" -ErrorAction Stop
@@ -1171,7 +1208,7 @@ function Invoke-RiskySetupKrbtgtScheduledRotation {
     }
 
     Invoke-Guarded -Description ("Installation/test du gMSA {0} sur {1}" -f $gmsaName, $targetDC) -Action {
-        Invoke-Command -ComputerName $targetDC -ScriptBlock {
+        Invoke-OnDC -ComputerName $targetDC -ScriptBlock {
             param($name)
             Import-Module ActiveDirectory -ErrorAction SilentlyContinue
             Install-ADServiceAccount -Identity $name -ErrorAction Stop
@@ -1185,7 +1222,7 @@ function Invoke-RiskySetupKrbtgtScheduledRotation {
 
     Invoke-Guarded -Description "Deploiement du script de rotation sur le DC cible" -Action {
         $scriptContent = Get-KrbtgtRotationScriptContent
-        Invoke-Command -ComputerName $targetDC -ScriptBlock {
+        Invoke-OnDC -ComputerName $targetDC -ScriptBlock {
             param($content)
             $dir = "C:\SEC-Scripts"
             if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
@@ -1194,7 +1231,7 @@ function Invoke-RiskySetupKrbtgtScheduledRotation {
     }
 
     Invoke-Guarded -Description ("Creation de la tache planifiee (tous les {0} jours) sur {1}" -f $days, $targetDC) -Action {
-        Invoke-Command -ComputerName $targetDC -ScriptBlock {
+        Invoke-OnDC -ComputerName $targetDC -ScriptBlock {
             param($gmsaSam, $domainNetbios, $intervalDays)
             $taskName = "SEC - Rotation KRBTGT"
             $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument '-NoProfile -ExecutionPolicy Bypass -File "C:\SEC-Scripts\Reset-KrbtgtScheduled.ps1"'
@@ -1557,7 +1594,7 @@ function Invoke-RiskyDisableSpoolerOnDCs {
     $printerReport = @{}
     foreach ($dc in $dcs) {
         try {
-            $printers = @(Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+            $printers = @(Invoke-OnDC -ComputerName $dc.HostName -ScriptBlock {
                 Get-Printer -ErrorAction Stop | Select-Object Name, Shared, PortName
             } -ErrorAction Stop)
             $printerReport[$dc.HostName] = @{ Ok = $true; Printers = $printers }
@@ -1601,7 +1638,7 @@ function Invoke-RiskyDisableSpoolerOnDCs {
         }
 
         Invoke-Guarded -Description ("Arret Spooler sur {0}" -f $dc.HostName) -Action {
-            Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+            Invoke-OnDC -ComputerName $dc.HostName -ScriptBlock {
                 Stop-Service -Name Spooler -Force -ErrorAction Stop
                 Set-Service -Name Spooler -StartupType Disabled
             } -ErrorAction Stop
@@ -1624,7 +1661,7 @@ function Invoke-Audit9TimeSyncStatus {
 
     foreach ($dc in $dcs) {
         try {
-            $source = Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+            $source = Invoke-OnDC -ComputerName $dc.HostName -ScriptBlock {
                 (& w32tm.exe /query /source 2>&1 | Out-String).Trim()
             } -ErrorAction Stop
             $isPdc = $dc.HostName -eq $pdc
@@ -1652,7 +1689,7 @@ function Invoke-Remediate9ConfigurePdcTimeSource {
     if (-not (Confirm-Action ("Configurer {0} (PDC Emulator) pour se synchroniser sur : {1}" -f $pdc, $peerList) -Strong)) { return }
 
     Invoke-Guarded -Description ("Configuration NTP sur {0}" -f $pdc) -Action {
-        Invoke-Command -ComputerName $pdc -ScriptBlock {
+        Invoke-OnDC -ComputerName $pdc -ScriptBlock {
             param($peers)
             & w32tm.exe /config /manualpeerlist:"$peers" /syncfromflags:manual /reliable:yes /update | Out-Null
             Restart-Service w32time -Force
@@ -1675,7 +1712,7 @@ function Invoke-Audit9InstalledRoles {
     $expected = @('AD-Domain-Services','DNS','RSAT-AD-Tools','RSAT-DNS-Server','GPMC','FS-FileServer')
     $rows = foreach ($dc in $dcs) {
         try {
-            Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+            Invoke-OnDC -ComputerName $dc.HostName -ScriptBlock {
                 param($expectedList)
                 Get-WindowsFeature | Where-Object { $_.InstallState -eq 'Installed' -and $_.Name -notin $expectedList } |
                     Select-Object @{N='DC';E={$env:COMPUTERNAME}}, Name, DisplayName
@@ -1743,7 +1780,7 @@ function Invoke-RiskyEnforceLdapSigning {
 
     foreach ($dc in $dcs) {
         Invoke-Guarded -Description ("LDAP signing/channel binding sur {0}" -f $dc.HostName) -Action {
-            Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+            Invoke-OnDC -ComputerName $dc.HostName -ScriptBlock {
                 Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters" -Name "LDAPServerIntegrity" -Value 2 -Type DWord
                 Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters" -Name "LdapEnforceChannelBinding" -Value 2 -Type DWord
             } -ErrorAction Stop
@@ -2172,7 +2209,7 @@ function Invoke-Audit7Smb1Usage {
     if ((Read-Host "Activer/verifier l'audit SMBv1 sur ces DC avant lecture du journal ? (O/N)") -match '^[oOyY]') {
         foreach ($dc in $dcs) {
             Invoke-Guarded -Description ("Activation de l'audit SMBv1 sur {0}" -f $dc.HostName) -Action {
-                Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+                Invoke-OnDC -ComputerName $dc.HostName -ScriptBlock {
                     Set-SmbServerConfiguration -AuditSmb1Access $true -Confirm:$false
                 } -ErrorAction Stop
             }
@@ -2182,7 +2219,7 @@ function Invoke-Audit7Smb1Usage {
     $allRows = @()
     foreach ($dc in $dcs) {
         try {
-            $rows = Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+            $rows = Invoke-OnDC -ComputerName $dc.HostName -ScriptBlock {
                 try {
                     Get-WinEvent -LogName "Microsoft-Windows-SMBServer/Audit" -ErrorAction Stop |
                         Where-Object { $_.Id -eq 3000 } |
@@ -2224,7 +2261,7 @@ function Invoke-Audit7SmbSigningStatus {
 
     $rows = foreach ($dc in $dcs) {
         try {
-            Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+            Invoke-OnDC -ComputerName $dc.HostName -ScriptBlock {
                 $srv = Get-SmbServerConfiguration
                 $cli = Get-SmbClientConfiguration
                 [PSCustomObject]@{
@@ -2265,7 +2302,7 @@ function Invoke-Remediate7DisableSmb1 {
 
     foreach ($dc in $dcs) {
         Invoke-Guarded -Description ("Desactivation SMBv1 sur {0}" -f $dc.HostName) -Action {
-            Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+            Invoke-OnDC -ComputerName $dc.HostName -ScriptBlock {
                 Set-SmbServerConfiguration -EnableSMB1Protocol $false -Confirm:$false
                 Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart -ErrorAction SilentlyContinue | Out-Null
             } -ErrorAction Stop
@@ -2342,7 +2379,7 @@ function Invoke-Audit7SensitiveShares {
 
     $rows = foreach ($name in $wr.Reachable) {
         try {
-            Invoke-Command -ComputerName $name -ScriptBlock {
+            Invoke-OnDC -ComputerName $name -ScriptBlock {
                 Get-SmbShare | Where-Object { -not $_.Special } | ForEach-Object {
                     $share = $_
                     Get-SmbShareAccess -Name $share.Name | Where-Object {
@@ -2393,7 +2430,7 @@ function Invoke-Remediate7DisableSmb1OnComputers {
 
     foreach ($name in $wr.Reachable) {
         Invoke-Guarded -Description ("Desactivation SMBv1 sur {0}" -f $name) -Action {
-            Invoke-Command -ComputerName $name -ScriptBlock {
+            Invoke-OnDC -ComputerName $name -ScriptBlock {
                 Set-SmbServerConfiguration -EnableSMB1Protocol $false -Confirm:$false
                 Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart -ErrorAction SilentlyContinue | Out-Null
             } -ErrorAction Stop
@@ -2426,7 +2463,7 @@ function Invoke-Audit8LdapsCertificates {
 
         $certInfo = $null
         try {
-            $certInfo = Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+            $certInfo = Invoke-OnDC -ComputerName $dc.HostName -ScriptBlock {
                 param($fqdn)
                 $certs = Get-ChildItem -Path Cert:\LocalMachine\My | Where-Object {
                     $_.EnhancedKeyUsageList.ObjectId -contains '1.3.6.1.5.5.7.3.1' -and
@@ -2485,7 +2522,7 @@ function Invoke-Audit8LdapSimpleBinds {
     if ((Read-Host "Activer/verifier le diagnostic LDAP Interface Events sur ces DC avant lecture ? (O/N)") -match '^[oOyY]') {
         foreach ($dc in $dcs) {
             Invoke-Guarded -Description ("Activation du diagnostic LDAP Interface Events sur {0}" -f $dc.HostName) -Action {
-                Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+                Invoke-OnDC -ComputerName $dc.HostName -ScriptBlock {
                     Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Diagnostics" -Name "16 LDAP Interface Events" -Value 2 -Type DWord
                 } -ErrorAction Stop
             }
@@ -2495,7 +2532,7 @@ function Invoke-Audit8LdapSimpleBinds {
 
     $rows = foreach ($dc in $dcs) {
         try {
-            Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+            Invoke-OnDC -ComputerName $dc.HostName -ScriptBlock {
                 $evt = Get-WinEvent -FilterHashtable @{ LogName = 'Directory Service'; Id = 2887 } -MaxEvents 1 -ErrorAction Stop
                 [PSCustomObject]@{
                     DC          = $env:COMPUTERNAME
@@ -2530,7 +2567,7 @@ function Invoke-Remediate8DisableWeakTls {
 
     foreach ($dc in $dcs) {
         Invoke-Guarded -Description ("Durcissement SCHANNEL (TLS) sur {0}" -f $dc.HostName) -Action {
-            Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+            Invoke-OnDC -ComputerName $dc.HostName -ScriptBlock {
                 $base = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols"
                 foreach ($proto in @('TLS 1.0','TLS 1.1')) {
                     foreach ($role in @('Client','Server')) {
@@ -3157,7 +3194,7 @@ function Invoke-Audit13DefenderStatus {
 
     $rows = foreach ($name in $wr.Reachable) {
         try {
-            Invoke-Command -ComputerName $name -ScriptBlock {
+            Invoke-OnDC -ComputerName $name -ScriptBlock {
                 $status = Get-MpComputerStatus -ErrorAction Stop
                 $pref = Get-MpPreference -ErrorAction Stop
                 [PSCustomObject]@{
@@ -3196,7 +3233,7 @@ function Invoke-Audit13LocalAdmins {
 
     $rows = foreach ($name in $wr.Reachable) {
         try {
-            Invoke-Command -ComputerName $name -ScriptBlock {
+            Invoke-OnDC -ComputerName $name -ScriptBlock {
                 Get-LocalGroupMember -Group "Administrateurs" -ErrorAction SilentlyContinue
                 if (-not $?) { Get-LocalGroupMember -Group "Administrators" -ErrorAction SilentlyContinue }
             } -ErrorAction Stop | ForEach-Object {
@@ -3325,7 +3362,7 @@ function Invoke-Remediate13CleanupLocalAdmins {
 
     $members = @()
     try {
-        $members = Invoke-Command -ComputerName $machine -ScriptBlock {
+        $members = Invoke-OnDC -ComputerName $machine -ScriptBlock {
             try { Get-LocalGroupMember -Group "Administrateurs" -ErrorAction Stop } catch { Get-LocalGroupMember -Group "Administrators" -ErrorAction Stop }
         } -ErrorAction Stop
     } catch {
@@ -3345,7 +3382,7 @@ function Invoke-Remediate13CleanupLocalAdmins {
 
     foreach ($t in $targets) {
         Invoke-Guarded -Description ("Retrait de {0} des administrateurs locaux de {1}" -f $t.Name, $machine) -Action {
-            Invoke-Command -ComputerName $machine -ScriptBlock {
+            Invoke-OnDC -ComputerName $machine -ScriptBlock {
                 param($member)
                 try { Remove-LocalGroupMember -Group "Administrateurs" -Member $member -ErrorAction Stop }
                 catch { Remove-LocalGroupMember -Group "Administrators" -Member $member -ErrorAction Stop }
@@ -3462,7 +3499,7 @@ function Invoke-Audit14GlobalQueryBlockList {
 
     foreach ($dc in $dcs) {
         try {
-            $list = Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+            $list = Invoke-OnDC -ComputerName $dc.HostName -ScriptBlock {
                 (Get-DnsServerGlobalQueryBlockList -ErrorAction Stop)
             } -ErrorAction Stop
             $hasWpad = $list.List -contains 'wpad'
@@ -3490,7 +3527,7 @@ function Invoke-Remediate14RestoreGlobalQueryBlockList {
 
     foreach ($dc in $dcs) {
         Invoke-Guarded -Description ("Retablissement de la Global Query Block List sur {0}" -f $dc.HostName) -Action {
-            Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+            Invoke-OnDC -ComputerName $dc.HostName -ScriptBlock {
                 Set-DnsServerGlobalQueryBlockList -List @('wpad','isatap') -Enable $true -ErrorAction Stop
             } -ErrorAction Stop
         }
@@ -3516,7 +3553,7 @@ function Invoke-Remediate14DisableNetbiosOnComputers {
 
     foreach ($name in $wr.Reachable) {
         Invoke-Guarded -Description ("Desactivation NetBIOS sur {0}" -f $name) -Action {
-            Invoke-Command -ComputerName $name -ScriptBlock {
+            Invoke-OnDC -ComputerName $name -ScriptBlock {
                 Get-WmiObject Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True" | ForEach-Object {
                     # SetTcpipNetbios(2) = desactiver NetBIOS sur TCP/IP pour cette interface
                     $_.SetTcpipNetbios(2) | Out-Null
@@ -3627,7 +3664,7 @@ function Invoke-Audit14ExposedServices {
 
     $rows = foreach ($dc in $dcs) {
         try {
-            Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+            Invoke-OnDC -ComputerName $dc.HostName -ScriptBlock {
                 Get-NetTCPConnection -State Listen -ErrorAction Stop | ForEach-Object {
                     $procName = try { (Get-Process -Id $_.OwningProcess -ErrorAction Stop).ProcessName } catch { "?" }
                     [PSCustomObject]@{ DC = $env:COMPUTERNAME; Port = $_.LocalPort; Processus = $procName }
@@ -3664,7 +3701,7 @@ function Invoke-Audit17SystemStateBackupStatus {
 
     $rows = foreach ($dc in $dcs) {
         try {
-            Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+            Invoke-OnDC -ComputerName $dc.HostName -ScriptBlock {
                 $output = & wbadmin.exe get versions 2>&1 | Out-String
                 if ($output -match 'Version identifier:\s*([0-9/:-]+)') {
                     [PSCustomObject]@{ DC = $env:COMPUTERNAME; SauvegardeTrouvee = $true; DerniereVersion = $Matches[1].Trim() }
@@ -3717,7 +3754,7 @@ function Invoke-Remediate17ScheduleSystemStateBackup {
     if (-not (Confirm-Action ("Planifier une sauvegarde System State quotidienne a {0} sur {1}, cible {2}" -f $timeInput, $targetDC, $target) -Strong)) { return }
 
     Invoke-Guarded -Description ("Installation de Windows Server Backup sur {0} (si absente)" -f $targetDC) -Action {
-        Invoke-Command -ComputerName $targetDC -ScriptBlock {
+        Invoke-OnDC -ComputerName $targetDC -ScriptBlock {
             if (-not (Get-WindowsFeature -Name Windows-Server-Backup -ErrorAction SilentlyContinue).Installed) {
                 Install-WindowsFeature -Name Windows-Server-Backup -ErrorAction Stop | Out-Null
             }
@@ -3725,7 +3762,7 @@ function Invoke-Remediate17ScheduleSystemStateBackup {
     }
 
     Invoke-Guarded -Description ("Creation de la tache planifiee de sauvegarde System State sur {0}" -f $targetDC) -Action {
-        Invoke-Command -ComputerName $targetDC -ScriptBlock {
+        Invoke-OnDC -ComputerName $targetDC -ScriptBlock {
             param($backupTarget, $time)
             $taskName = "SEC - Sauvegarde System State"
             $action = New-ScheduledTaskAction -Execute "wbadmin.exe" -Argument "start systemstatebackup -backupTarget:$backupTarget -quiet"
@@ -3884,7 +3921,7 @@ function Invoke-Audit18LegacyProtocolsOnComputers {
 
     $rows = foreach ($name in $wr.Reachable) {
         try {
-            Invoke-Command -ComputerName $name -ScriptBlock {
+            Invoke-OnDC -ComputerName $name -ScriptBlock {
                 $smb1 = $false
                 try { $smb1 = (Get-SmbServerConfiguration -ErrorAction Stop).EnableSMB1Protocol } catch { }
 
@@ -4215,7 +4252,7 @@ function Invoke-ReportNtlmV1Usage {
     foreach ($dc in $dcs) {
         Write-Host ("Analyse de {0}..." -f $dc.HostName) -ForegroundColor DarkGray
         try {
-            $rows = Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+            $rows = Invoke-OnDC -ComputerName $dc.HostName -ScriptBlock {
                 param($sinceDays)
                 # Filtre applique cote serveur (efficace) sur les evenements de logon NTLMv1/LM
                 # uniquement. On lit les champs XML (Name=...) et non le texte du message, qui
@@ -4477,7 +4514,7 @@ function Grant-DisableAutomationPermissions {
     $domainNetbios = (Get-ADDomain).NetBIOSName
 
     Invoke-Guarded -Description ("Delegation (userAccountControl + creation/suppression User/Computer) sur {0} a {1}" -f $DelegationRootDN, $PrincipalSam) -Action {
-        Invoke-Command -ComputerName $TargetDC -ScriptBlock {
+        Invoke-OnDC -ComputerName $TargetDC -ScriptBlock {
             param($rootDN, $account)
             & dsacls.exe "$rootDN" /I:S /G "${account}:WP;userAccountControl;user" | Out-Null
             & dsacls.exe "$rootDN" /I:S /G "${account}:WP;userAccountControl;computer" | Out-Null
@@ -4565,7 +4602,7 @@ function Invoke-AutomationSetupScheduledTask {
     }
 
     Invoke-Guarded -Description ("Installation/test du gMSA {0} sur {1}" -f $gmsaName, $targetDC) -Action {
-        Invoke-Command -ComputerName $targetDC -ScriptBlock {
+        Invoke-OnDC -ComputerName $targetDC -ScriptBlock {
             param($name)
             Import-Module ActiveDirectory -ErrorAction SilentlyContinue
             Install-ADServiceAccount -Identity $name -ErrorAction Stop
@@ -4582,7 +4619,7 @@ function Invoke-AutomationSetupScheduledTask {
             -ApplyUsers $applyUsers -ApplyComputers $applyComputers `
             -ExcludedOUsUsers $excludedOUsUsers -ExcludedOUsComputers $excludedOUsComputers -ExcludedGroups $excludedGroups `
             -DisableUserOUName $Script:DisableUserOUName -DisableComputerOUName $Script:DisableComputerOUName
-        Invoke-Command -ComputerName $targetDC -ScriptBlock {
+        Invoke-OnDC -ComputerName $targetDC -ScriptBlock {
             param($content)
             $dir = "C:\SEC-Scripts"
             if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
@@ -4591,7 +4628,7 @@ function Invoke-AutomationSetupScheduledTask {
     }
 
     Invoke-Guarded -Description ("Creation de la tache planifiee (tous les {0} jours) sur {1}" -f $daysInterval, $targetDC) -Action {
-        Invoke-Command -ComputerName $targetDC -ScriptBlock {
+        Invoke-OnDC -ComputerName $targetDC -ScriptBlock {
             param($gmsaSam, $domainNetbios, $intervalDays)
             $taskName = "SEC - Desactivation Auto (date/anciennete)"
             $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument '-NoProfile -ExecutionPolicy Bypass -File "C:\SEC-Scripts\Disable-ByDate.ps1"'
@@ -4616,7 +4653,7 @@ function Invoke-AutomationShowStatus {
     $taskName = "SEC - Desactivation Auto (date/anciennete)"
     foreach ($dc in $dcs) {
         try {
-            $task = Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+            $task = Invoke-OnDC -ComputerName $dc.HostName -ScriptBlock {
                 param($name)
                 Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue | Get-ScheduledTaskInfo -ErrorAction SilentlyContinue
             } -ArgumentList $taskName -ErrorAction Stop
@@ -4646,7 +4683,7 @@ function Invoke-AutomationRemoveScheduledTask {
     if (-not (Confirm-Action ("Supprimer la tache planifiee de desactivation automatique sur {0}" -f $targetDC) -Strong)) { return }
 
     Invoke-Guarded -Description ("Suppression de la tache planifiee sur {0}" -f $targetDC) -Action {
-        Invoke-Command -ComputerName $targetDC -ScriptBlock {
+        Invoke-OnDC -ComputerName $targetDC -ScriptBlock {
             Unregister-ScheduledTask -TaskName "SEC - Desactivation Auto (date/anciennete)" -Confirm:$false -ErrorAction Stop
         } -ErrorAction Stop
     }
