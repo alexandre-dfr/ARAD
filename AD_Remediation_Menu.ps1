@@ -27,6 +27,13 @@
       -LogDir      : dossier des journaux/rapports (defaut : .\Logs).
       -NoClear     : ne pas effacer l'ecran entre deux menus (utile pour
                      garder l'historique d'une session dans la console).
+      -Action      : lance directement une action "theme.item" (ex : 4.2), puis
+                     quitte (les questions interactives de l'action restent posees).
+      -Simulation  : avec -Action, force le mode simulation (defaut). -Action 1.1
+                     -Simulation:$false demande la confirmation habituelle du mode reel.
+
+    Le script peut etre "dot-source" (. .\AD_Remediation_Menu.ps1) sans lancer le
+    menu : utilise par les tests automatises (Tests\Invoke-SelfTest.ps1).
     ------------------------------------------------------------------
 #>
 
@@ -34,14 +41,16 @@
 param(
     [switch]$QuickAudit,
     [string]$LogDir,
-    [switch]$NoClear
+    [switch]$NoClear,
+    [ValidatePattern('^\d{1,2}[\.\-]\d{1,2}$')][string]$Action,
+    [bool]$Simulation = $true
 )
 
 # ============================================================
 #  CONFIGURATION GLOBALE
 # ============================================================
 
-$Script:Version        = "3.0"
+$Script:Version        = "3.1"
 $Script:SimulationMode = $true
 $Script:NoClear        = [bool]$NoClear
 $Script:SessionStamp   = Get-Date -Format "yyyyMMdd_HHmmss"
@@ -82,7 +91,12 @@ $Script:SessionReports        = [System.Collections.Generic.List[string]]::new()
 $Script:SessionHistory        = [System.Collections.Generic.List[object]]::new()
 $Script:CurrentActionFailures = 0
 $Script:LastDiagnostic        = $null
+$Script:PreviousDiagnostic    = $null
 $Script:StrictGroupQueries    = $false
+$Script:LastGuardedResult     = $null
+$Script:LastActionRef         = $null
+$Script:DCListCache           = $null
+$Script:DiagHistoryDir        = Join-Path -Path $Script:LogDir -ChildPath "Diagnostics"
 
 foreach ($dir in @($Script:LogDir)) {
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
@@ -177,6 +191,14 @@ function Show-Banner {
     if ($s.Actions -gt 0 -or $Script:SessionReports.Count -gt 0) {
         Write-Host ("  Session   : {0} action(s) [{1} ok / {2} echec / {3} simulee(s)], {4} rapport(s)" -f $s.Actions, $s.Succes, $s.Echecs, $s.Simulees, $Script:SessionReports.Count) -ForegroundColor DarkGray
     }
+    if ($Script:LastDiagnostic) {
+        $d = $Script:LastDiagnostic
+        $nc = @($d.Findings | Where-Object { $_.Statut -eq 'CRITIQUE' }).Count
+        $na = @($d.Findings | Where-Object { $_.Statut -eq 'ALERTE' }).Count
+        Write-Host "  Diagnostic: " -ForegroundColor DarkGray -NoNewline
+        Write-Host ("indice {0}/100" -f $d.Score) -ForegroundColor $(if ($d.Score -ge 80) { 'Green' } elseif ($d.Score -ge 50) { 'Yellow' } else { 'Red' }) -NoNewline
+        Write-Host (" - {0} critique(s), {1} alerte(s) - {2:HH:mm} (actions concernees marquees '!' dans les menus)" -f $nc, $na, $d.Date) -ForegroundColor DarkGray
+    }
     Write-Host $line -ForegroundColor DarkCyan
     Write-Host "  Legende : " -ForegroundColor DarkGray -NoNewline
     Write-Host "[AUDIT] " -ForegroundColor Cyan -NoNewline
@@ -270,14 +292,6 @@ function Select-FromList {
     $idx = @(ConvertTo-IndexList -Selection $sel -Count $Items.Count)
     if ($Single -and $idx.Count -gt 1) { $idx = @($idx[0]) }
     return @($idx | ForEach-Object { $Items[$_] })
-}
-
-function Select-AccountsInteractive {
-    param(
-        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Accounts,
-        [Parameter(Mandatory)][string]$Prompt
-    )
-    return @(Select-FromList -Items $Accounts -Prompt $Prompt)
 }
 
 function Confirm-Action {
@@ -432,6 +446,41 @@ function ConvertFrom-FileTimeSafe {
     } catch { return $null }
 }
 
+function Get-ComputerAccountKind {
+    <#
+        Nature reelle d'un objet renvoye par Get-ADComputer. Les comptes de service geres (MSA,
+        gMSA, dMSA) DERIVENT de la classe 'computer' : Get-ADComputer les renvoie, ce qui
+        faussait la couverture LAPS, les comptes inactifs et l'inventaire des OS (faux positifs).
+        Retourne : MSA, DC, EntraSSO (AZUREADSSOACC), Cluster (CNO/VCO), NonWindows ou Computer.
+        Les proprietes PrimaryGroupID, ServicePrincipalName et OperatingSystem doivent avoir ete
+        demandees pour les distinctions correspondantes.
+    #>
+    param([Parameter(Mandatory)]$Computer)
+    $cls = [string]$Computer.ObjectClass
+    if ($cls -in 'msDS-GroupManagedServiceAccount', 'msDS-ManagedServiceAccount', 'msDS-DelegatedManagedServiceAccount') { return 'MSA' }
+    if ($Computer.PrimaryGroupID -in 516, 521) { return 'DC' }
+    if ([string]$Computer.SamAccountName -ieq 'AZUREADSSOACC$') { return 'EntraSSO' }
+    if (@(@($Computer.ServicePrincipalName) -match '^MSClusterVirtualServer/').Count -gt 0) { return 'Cluster' }
+    $os = [string]$Computer.OperatingSystem
+    if ($os -and $os -notmatch 'Windows') { return 'NonWindows' }
+    return 'Computer'
+}
+
+function Get-GppPasswordEntries {
+    <#
+        Extrait d'un fichier de preferences GPO (Groups.xml, Services.xml...) chaque element
+        portant un 'cpassword' NON vide, avec le compte declare DANS LE MEME element (auparavant
+        le premier compte du fichier etait attribue a tous les mots de passe trouves).
+    #>
+    param([AllowEmptyString()][string]$Content)
+    if ([string]::IsNullOrEmpty($Content)) { return @() }
+    return @(foreach ($m in [regex]::Matches($Content, '<(\w+)\s[^>]*\bcpassword="([^"]+)"[^>]*>')) {
+        $tag = $m.Value
+        $user = if ($tag -match '\b(?:userName|accountName|runAs|username)="([^"]*)"') { $Matches[1] } else { $null }
+        [PSCustomObject]@{ Element = $m.Groups[1].Value; Compte = $user }
+    })
+}
+
 # ============================================================
 #  CONTEXTE ACTIVE DIRECTORY (cache, groupes, SID bien connus)
 # ============================================================
@@ -504,6 +553,17 @@ function Resolve-ADGroupRef {
     return [PSCustomObject]@{ Name = $Name; Identity = ("{0}-{1}" -f $dom.DomainSID.Value, $entry.Rid); Server = $null }
 }
 
+function Test-IsADNotFoundError {
+    # Vrai si l'erreur signifie "objet introuvable" (et non droits/connectivite).
+    param($ErrorRecord)
+    $e = $ErrorRecord.Exception
+    while ($e) {
+        if ($e.GetType().Name -eq 'ADIdentityNotFoundException') { return $true }
+        $e = $e.InnerException
+    }
+    return $false
+}
+
 function Get-GroupMembersSafe {
     <#
         Get-ADGroupMember robuste : resolution par SID bien connu, ciblage du domaine
@@ -521,6 +581,12 @@ function Get-GroupMembersSafe {
         if ($Recursive) { $p['Recursive'] = $true }
         return @(Get-ADGroupMember @p)
     } catch {
+        # Groupe INEXISTANT (ex : Key Admins avant le niveau 2016, DnsAdmins sans DNS integre a
+        # l'AD) : il n'a reellement aucun membre - ce n'est pas une erreur de lecture.
+        if (Test-IsADNotFoundError $_) {
+            Write-Verbose ("Groupe '{0}' absent de l'annuaire : aucun membre." -f $Group)
+            return @()
+        }
         # En mode strict (diagnostic), un groupe illisible doit faire echouer le controle (statut
         # ERREUR) plutot que d'etre compte comme vide (faux OK).
         if ($Script:StrictGroupQueries) { throw }
@@ -582,10 +648,19 @@ function Get-AlwaysProtectedPrincipalSids {
 }
 
 function Get-DomainControllersList {
-    # @() force un tableau meme s'il n'y a qu'1 seul DC.
+    <#
+        Liste des DC du domaine, mise en cache pour la session (interrogee par la plupart des
+        actions). -Refresh relit l'annuaire ; -Strict leve une exception en cas d'echec au lieu
+        de retourner une liste vide (le diagnostic ne doit jamais conclure "0 DC" sur une erreur).
+    #>
+    param([switch]$Refresh, [switch]$Strict)
+    if ($Script:DCListCache -and -not $Refresh) { return @($Script:DCListCache) }
     try {
-        return @(Get-ADDomainController -Filter * -ErrorAction Stop | Sort-Object HostName)
+        # @() force un tableau meme s'il n'y a qu'1 seul DC.
+        $Script:DCListCache = @(Get-ADDomainController -Filter * -ErrorAction Stop | Sort-Object HostName)
+        return @($Script:DCListCache)
     } catch {
+        if ($Strict) { throw }
         Write-Log "Impossible de lister les controleurs de domaine : $($_.Exception.Message)" -Level ERROR
         return @()
     }
@@ -784,7 +859,10 @@ function Get-TargetComputers {
         $seen = [System.Collections.Generic.HashSet[string]]::new()
         foreach ($ou in $targetOU) {
             foreach ($c in @(Get-ADComputer -SearchBase $ou -Filter 'Enabled -eq $true' -Properties DNSHostName, PrimaryGroupID -ErrorAction SilentlyContinue)) {
-                if (-not $IncludeDCs -and $c.PrimaryGroupID -in 516, 521) { continue }
+                $kind = Get-ComputerAccountKind -Computer $c
+                # Comptes de service geres / compte Seamless SSO : pas de machine derriere.
+                if ($kind -in 'MSA', 'EntraSSO') { continue }
+                if (-not $IncludeDCs -and $kind -eq 'DC') { continue }
                 if ($seen.Add($c.DistinguishedName)) { $names += $(if ($c.DNSHostName) { $c.DNSHostName } else { $c.Name }) }
             }
         }
@@ -1578,6 +1656,153 @@ function Invoke-Audit3SensitiveGroupsMembership {
     [void](Export-Report -Rows $rows -Name "Rapport_GroupesSensibles")
 }
 
+function Get-DomainRootDangerousAces {
+    <#
+        ACE "Autoriser" de la racine du domaine qui donnent le controle du domaine : DCSync
+        (Replicating Directory Changes All, ou "tous les droits etendus"), Controle total,
+        WriteDacl, WriteOwner. Les titulaires legitimes par defaut (Domain Controllers,
+        Enterprise Domain Controllers, Administrateurs, Domain/Enterprise Admins, SYSTEM) sont
+        ignores. Comparaison par SID (independante de la langue). Les ACE "heritage seulement"
+        ou limitees a un type d'objet enfant ne s'appliquent pas a la racine : ignorees.
+        Note : "Controle total" est un masque COMPOSITE, teste par egalite (un simple -band
+        signalerait a tort toute ACE de lecture).
+    #>
+    $dom = Get-CachedADDomain
+    $sid = $dom.DomainSID.Value
+    $rootSid = Get-RootDomainSid
+    $legit = @("$sid-512", "$sid-516", "$rootSid-519", "$rootSid-498", 'S-1-5-9', 'S-1-5-18', 'S-1-5-32-544')
+    $acl = (Get-ADObject -Identity $dom.DistinguishedName -Properties nTSecurityDescriptor -ErrorAction Stop).nTSecurityDescriptor
+    if (-not $acl) { throw "Descripteur de securite de la racine du domaine illisible." }
+    $getChangesAll = [guid]'1131f6ad-9c07-11d1-f79f-00c04fc2dcd2'
+    $R = [System.DirectoryServices.ActiveDirectoryRights]
+    $rows = foreach ($ace in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+        if ($ace.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+        if ($ace.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+        if ($ace.InheritedObjectType -ne [guid]::Empty) { continue }
+        $aceSid = $ace.IdentityReference.Value
+        if ($legit -contains $aceSid) { continue }
+        $rights = $ace.ActiveDirectoryRights
+        $what = @()
+        if (($rights -band $R::GenericAll) -eq $R::GenericAll) { $what += 'Controle total' }
+        else {
+            if ($rights -band $R::WriteDacl) { $what += 'Modifier les permissions (WriteDacl)' }
+            if ($rights -band $R::WriteOwner) { $what += 'Modifier le proprietaire (WriteOwner)' }
+            if (($rights -band $R::ExtendedRight) -and ($ace.ObjectType -eq $getChangesAll -or $ace.ObjectType -eq [guid]::Empty)) { $what += 'DCSync (Replicating Directory Changes All)' }
+        }
+        if ($what.Count -eq 0) { continue }
+        $name = try { $ace.IdentityReference.Translate([System.Security.Principal.NTAccount]).Value } catch { $aceSid }
+        [PSCustomObject]@{
+            Principal            = $name
+            SID                  = $aceSid
+            Droits               = $what -join ', '
+            # Entra Connect (MSOL_*, AAD_*), ancien DirSync (Sync_*), agent Entra Cloud Sync (provAgentgMSA).
+            SynchroEntraProbable = [bool]($name -match '\\(MSOL_|AAD_|Sync_|provAgentgMSA)')
+        }
+    }
+    return @($rows)
+}
+
+function Invoke-Audit3DomainRootControl {
+    Write-Section "Droits de replication (DCSync) et controle de la racine du domaine" Magenta
+    Write-Info "Un principal disposant de 'Replicating Directory Changes All' peut extraire TOUS les" `
+               "secrets du domaine (DCSync : hachage krbtgt -> Golden Ticket). Controle total, WriteDacl" `
+               "et WriteOwner sur la racine permettent de s'accorder ce droit. Les titulaires par defaut" `
+               "(DC, Administrateurs, Domain/Enterprise Admins) ne sont pas listes." `
+               "Les comptes de synchronisation Entra (MSOL_*, provAgentgMSA) ont legitimement ce droit : ils" `
+               "doivent alors etre proteges comme des comptes tier 0."
+    try { $rows = @(Get-DomainRootDangerousAces) } catch {
+        Write-Log ("Lecture de l'ACL de la racine du domaine impossible : {0}" -f $_.Exception.Message) -Level ERROR
+        return
+    }
+    if ($rows.Count -eq 0) { Write-Log "Aucun principal non standard ne controle la racine du domaine ni ne dispose du droit DCSync." -Level OK; return }
+    foreach ($r in $rows) {
+        $color = if ($r.SynchroEntraProbable) { 'Yellow' } else { 'Red' }
+        Write-Host ("  - {0} : {1}{2}" -f $r.Principal, $r.Droits, $(if ($r.SynchroEntraProbable) { '  (compte de synchronisation Entra Connect probable : a proteger en tier 0)' } else { '' })) -ForegroundColor $color
+    }
+    $unexpected = @($rows | Where-Object { -not $_.SynchroEntraProbable })
+    if ($unexpected.Count -gt 0) { Write-Log ("{0} principal(aux) inattendu(s) avec un controle du domaine : a verifier IMMEDIATEMENT (persistance d'attaquant possible, ou heritage Exchange)." -f $unexpected.Count) -Level ERROR }
+    [void](Export-Report -Rows $rows -Name "Rapport_ControleRacineDomaine" -Comment "Retrait d'une ACE : Utilisateurs et ordinateurs AD > Proprietes de la racine > Securite > Avance (apres validation).")
+}
+
+function Get-PrivilegedAccountsHygiene {
+    <#
+        Comptes membres (directs ou indirects) des groupes a privileges : DESACTIVES (membres
+        inutiles, a retirer) et ACTIFS mais INACTIFS depuis plus de $Days jours (ou jamais
+        connectes, hors comptes crees depuis moins de 30 jours). Le compte Administrateur
+        integre (RID 500), dont la non-utilisation est la bonne pratique, est exclu de
+        l'inactivite.
+    #>
+    param([int]$Days = 180)
+    $rid500 = "{0}-500" -f (Get-CachedADDomain).DomainSID.Value
+    $now = Get-Date
+    $users = @(Get-PrivilegedUsers -Groups $Script:PrivilegedGroups -Properties Enabled, LastLogonDate, PasswordLastSet, whenCreated)
+    return @(foreach ($u in $users) {
+        $state = $null
+        if (-not $u.Enabled) { $state = 'Desactive (a retirer des groupes a privileges)' }
+        elseif ($u.SID.Value -ne $rid500 -and $u.whenCreated -lt $now.AddDays(-30) -and (-not $u.LastLogonDate -or $u.LastLogonDate -lt $now.AddDays(-$Days))) {
+            $state = if ($u.LastLogonDate) { "Inactif depuis plus de $Days jours" } else { 'Jamais connecte' }
+        }
+        if ($state) {
+            [PSCustomObject]@{ SamAccountName = $u.SamAccountName; Actif = $u.Enabled; DerniereConnexion = $u.LastLogonDate; MdpChangeLe = $u.PasswordLastSet; Etat = $state; DN = $u.DistinguishedName }
+        }
+    })
+}
+
+function Invoke-Audit3PrivilegedAccountsHygiene {
+    Write-Section "Comptes a privileges inactifs ou desactives" Magenta
+    Write-Info "Un compte d'administration inutilise reste une cible (mot de passe ancien, souvent oublie" `
+               "des revues) ; un compte desactive n'a rien a faire dans un groupe a privileges." `
+               "LastLogonDate est replique avec un retard pouvant atteindre 14 jours."
+    $days = Read-IntValue -Prompt "Seuil d'inactivite (jours)" -Default 180 -Min 30 -Max 3650
+    $rows = @(Get-PrivilegedAccountsHygiene -Days $days)
+    if ($rows.Count -eq 0) { Write-Log ("Aucun compte a privileges desactive ou inactif depuis plus de {0} jours." -f $days) -Level OK; return }
+    Write-ListPreview -Items $rows -Color Yellow -Format { param($r) "{0} : {1} (derniere connexion : {2})" -f $r.SamAccountName, $r.Etat, $(if ($r.DerniereConnexion) { $r.DerniereConnexion.ToString('dd/MM/yyyy') } else { 'jamais' }) }
+    [void](Export-Report -Rows $rows -Name "Rapport_ComptesPrivilegiesInactifs" -Comment "Retirer des groupes, puis desactiver (theme 18) apres validation avec le titulaire.")
+}
+
+function Get-NonStandardPrimaryGroupAccounts {
+    <#
+        Comptes dont le GROUPE PRINCIPAL (primaryGroupID) n'est pas celui attendu : utilisateurs
+        513 (Utilisateurs du domaine) / 514 (Invites), ordinateurs 515 (Ordinateurs du domaine),
+        516 (DC), 521 (RODC). L'appartenance via le groupe principal n'apparait PAS dans l'attribut
+        memberOf : un primaryGroupID=512 donne les droits Domain Admins de facon discrete.
+    #>
+    $domSid = (Get-CachedADDomain).DomainSID.Value
+    $privileged = @(512, 516, 518, 519, 520, 521, 526, 527)
+    $objs = @(Get-ADUser -LDAPFilter '(&(!(primaryGroupID=513))(!(primaryGroupID=514)))' -Properties primaryGroupID, Enabled -ErrorAction Stop) +
+            @(Get-ADComputer -LDAPFilter '(&(!(primaryGroupID=515))(!(primaryGroupID=516))(!(primaryGroupID=521)))' -Properties primaryGroupID, Enabled -ErrorAction Stop)
+    $names = @{}
+    return @(foreach ($o in $objs) {
+        $pg = [int]$o.primaryGroupID
+        if (-not $names.ContainsKey($pg)) {
+            $names[$pg] = try { (Get-ADGroup -Identity ("{0}-{1}" -f $domSid, $pg) -ErrorAction Stop).Name } catch { "RID $pg" }
+        }
+        [PSCustomObject]@{
+            Compte         = $o.SamAccountName
+            Classe         = $o.ObjectClass
+            Actif          = $o.Enabled
+            GroupePrincipal = $names[$pg]
+            RID            = $pg
+            Evaluation     = if ($pg -in $privileged) { 'CRITIQUE : groupe principal privilegie (appartenance invisible dans memberOf)' } else { 'A verifier : groupe principal inhabituel' }
+            DN             = $o.DistinguishedName
+        }
+    })
+}
+
+function Invoke-Audit3NonStandardPrimaryGroup {
+    Write-Section "Groupe principal non standard (appartenance cachee)" Magenta
+    Write-Info "L'appartenance a un groupe via l'attribut primaryGroupID n'est pas visible dans memberOf" `
+               "ni dans la plupart des outils : technique de persistance discrete. Correction : remettre" `
+               "le groupe principal par defaut (Utilisateurs/Ordinateurs du domaine) apres verification."
+    try { $rows = @(Get-NonStandardPrimaryGroupAccounts) } catch {
+        Write-Log ("Recherche impossible : {0}" -f $_.Exception.Message) -Level ERROR
+        return
+    }
+    if ($rows.Count -eq 0) { Write-Log "Tous les comptes ont le groupe principal attendu." -Level OK; return }
+    Write-ListPreview -Items $rows -Color Yellow -Format { param($r) "{0} ({1}, actif={2}) : {3} -> {4}" -f $r.Compte, $r.Classe, $r.Actif, $r.GroupePrincipal, $r.Evaluation }
+    [void](Export-Report -Rows $rows -Name "Rapport_GroupePrincipalNonStandard" -Comment "Correction : Set-ADUser <compte> -Replace @{primaryGroupID=513} (ajouter d'abord le compte a 'Utilisateurs du domaine').")
+}
+
 # ============================================================
 #  THEME 2 - COMPTES DE SERVICE
 # ============================================================
@@ -2218,13 +2443,13 @@ function Invoke-Audit11GppPasswords {
     $rows = [System.Collections.Generic.List[object]]::new()
     foreach ($f in $files) {
         try {
-            $content = Get-Content -LiteralPath $f.FullName -Raw -ErrorAction Stop
-            foreach ($m in [regex]::Matches($content, 'cpassword="([^"]+)"')) {
-                $guid = if ($f.FullName -match '\{([0-9A-Fa-f-]{36})\}') { $Matches[1] } else { $null }
-                $gpoName = $null
-                if ($guid) { try { $gpoName = (Get-GPO -Guid $guid -ErrorAction Stop).DisplayName } catch { } }
-                $user = if ($content -match '(?:userName|accountName|runAs)="([^"]*)"') { $Matches[1] } else { $null }
-                $rows.Add([PSCustomObject]@{ GPO = $gpoName; GUID = $guid; Fichier = $f.FullName; Compte = $user })
+            $entries = @(Get-GppPasswordEntries -Content (Get-Content -LiteralPath $f.FullName -Raw -ErrorAction Stop))
+            if ($entries.Count -eq 0) { continue }
+            $guid = if ($f.FullName -match '\{([0-9A-Fa-f-]{36})\}') { $Matches[1] } else { $null }
+            $gpoName = $null
+            if ($guid) { try { $gpoName = (Get-GPO -Guid $guid -ErrorAction Stop).DisplayName } catch { $gpoName = "(GPO $guid)" } }
+            foreach ($e in $entries) {
+                $rows.Add([PSCustomObject]@{ GPO = $gpoName; GUID = $guid; Fichier = $f.FullName; Element = $e.Element; Compte = $e.Compte })
             }
         } catch { Write-Log ("Lecture impossible : {0}" -f $f.FullName) -Level WARN }
     }
@@ -2277,6 +2502,53 @@ function Invoke-Remediate11DisableReversibleEncryption {
             if ($forceChange) { Set-ADUser -Identity $acc.DistinguishedName -ChangePasswordAtLogon $true }
         }
     }
+}
+
+function Get-PasswordExcerpt {
+    <#
+        Heuristique : mot-cle de mot de passe SUIVI d'un separateur (":" ou "=") puis d'une valeur,
+        pour limiter les faux positifs ("Mot de passe n'expire jamais" n'est pas signale).
+        Retourne un extrait MASQUE (le secret n'est jamais restitue) ou $null.
+    #>
+    param([AllowEmptyString()][string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    $m = [regex]::Match($Text, '(?i)\b(pass(word|wd|e)?|pwd|mdp|mot\s*de\s*passe|motdepasse|kennwort|contrase.a)\s*[:=]\s*(?=\S)')
+    if (-not $m.Success) { return $null }
+    $start = [Math]::Max(0, $m.Index - 15)
+    return ($Text.Substring($start, $m.Index + $m.Length - $start) + '***')
+}
+
+function Get-PasswordInDescriptionCandidates {
+    # Comptes (utilisateurs/ordinateurs) dont description ou info (Notes) semble contenir un mot de passe.
+    $objs = @(Get-ADObject -LDAPFilter '(&(objectClass=user)(|(description=*)(info=*)))' -Properties description, info, sAMAccountName, userAccountControl -ErrorAction Stop)
+    return @(foreach ($o in $objs) {
+        foreach ($attr in 'description', 'info') {
+            $excerpt = Get-PasswordExcerpt -Text ((@($o.$attr) | Where-Object { $_ }) -join ' ')
+            if (-not $excerpt) { continue }
+            [PSCustomObject]@{
+                Compte   = $o.sAMAccountName
+                Classe   = $o.ObjectClass
+                Actif    = -not ([int]$o.userAccountControl -band 2)
+                Attribut = $attr
+                Extrait  = $excerpt
+                DN       = $o.DistinguishedName
+            }
+        }
+    })
+}
+
+function Invoke-Audit11PasswordInDescription {
+    Write-Section "Mots de passe potentiellement stockes dans la description / les notes des comptes" Magenta
+    Write-Info "Les attributs description et info sont LISIBLES PAR TOUT UTILISATEUR du domaine. Recherche" `
+               "heuristique ('mdp:', 'password=', 'pwd :'...) : a confirmer au cas par cas. Le secret" `
+               "eventuel n'est jamais affiche ni exporte (extrait masque)."
+    try { $rows = @(Get-PasswordInDescriptionCandidates) } catch {
+        Write-Log ("Recherche impossible : {0}" -f $_.Exception.Message) -Level ERROR
+        return
+    }
+    if ($rows.Count -eq 0) { Write-Log "Aucun motif de mot de passe detecte dans les descriptions/notes." -Level OK; return }
+    Write-ListPreview -Items $rows -Color Red -Format { param($r) "{0} ({1}, actif={2}) : {3}" -f $r.Compte, $r.Attribut, $r.Actif, $r.Extrait }
+    [void](Export-Report -Rows $rows -Name "Rapport_MotsDePasseDescription" -Comment "Effacer l'attribut ET changer le mot de passe concerne (il doit etre considere comme divulgue).")
 }
 
 # ============================================================
@@ -2449,7 +2721,7 @@ function Invoke-Audit5TrustsEncryption {
             elseif ($attr -band 0x4) { 'Actif (quarantaine)' }
             else { 'DESACTIVE' }
         $enc = $_.'msDS-SupportedEncryptionTypes'
-        $encLabel = if (-not $enc) { 'Non defini : RC4 (comportement historique des approbations)' } else { Get-SupportedEncryptionTypesLabel -Value $enc }
+        $encLabel = if (-not $enc) { 'Non defini : RC4 possible selon les DC (cocher AES sur l''approbation)' } else { Get-SupportedEncryptionTypesLabel -Value $enc }
         $issues = @()
         if ($sidFiltering -like 'RELACHE*' -or $sidFiltering -eq 'DESACTIVE') { $issues += 'filtrage SID' }
         if ($attr -band 0x800) { $issues += 'delegation TGT autorisee' }
@@ -2485,7 +2757,10 @@ function Invoke-Audit5KrbtgtStatus {
         $age = if ($_.PasswordLastSet) { [int]((Get-Date) - $_.PasswordLastSet).TotalDays } else { $null }
         [PSCustomObject]@{
             Compte       = $_.SamAccountName
-            Type         = if ($_.SamAccountName -eq 'krbtgt') { 'Domaine' } else { 'RODC : ' + (@($_.'msDS-KrbTgtLinkBl') -join ',' -replace '^CN=([^,]+).*', '$1') }
+            Type         = if ($_.SamAccountName -eq 'krbtgt') { 'Domaine' }
+                           elseif ($_.SamAccountName -ieq 'krbtgt_AzureAD') { 'Entra Kerberos (rotation : Set-AzureADKerberosServer -RotateServerKey)' }
+                           elseif (@($_.'msDS-KrbTgtLinkBl').Count -gt 0) { 'RODC : ' + ((@($_.'msDS-KrbTgtLinkBl') | ForEach-Object { $_ -replace '^CN=([^,]+).*', '$1' }) -join ',') }
+                           else { 'krbtgt de RODC orphelin (RODC supprime ?)' }
             MdpChangeLe  = $_.PasswordLastSet
             AgeJours     = $age
             Evaluation   = if ($null -eq $age) { 'Inconnu' } elseif ($age -gt 365) { 'CRITIQUE (> 1 an)' } elseif ($age -gt 180) { 'ALERTE (> 180 j)' } else { 'OK' }
@@ -2788,6 +3063,18 @@ function Invoke-Remediate5EnableKerberosArmoring {
     Write-OutcomeLog "Kerberos Armoring active en mode 'Pris en charge'. Ne passez en mode exigeant qu'apres validation que tous les clients concernes le supportent."
 }
 
+function Get-SidHistoryRisk {
+    <#
+        Evaluation d'une entree sIDHistory (logique unique pour l'audit ET le diagnostic) :
+        CRITIQUE si SID du domaine courant, SID integre (S-1-5-32-*) ou RID privilegie de
+        n'importe quel domaine (500, 512, 516, 518, 519, 520, 521, 498, 526, 527).
+    #>
+    param([Parameter(Mandatory)][string]$Sid, [Parameter(Mandatory)][string]$DomainSid)
+    if ($Sid -like "$DomainSid-*") { return 'CRITIQUE : SID du domaine courant' }
+    if ($Sid -like 'S-1-5-32-*' -or $Sid -match '-(500|512|516|518|519|520|521|498|526|527)$') { return 'CRITIQUE : SID privilegie' }
+    return 'A verifier : migration terminee ?'
+}
+
 function Invoke-Audit5SidHistory {
     Write-Section "Comptes porteurs d'un sIDHistory" Magenta
     Write-Info "Le sIDHistory (heritage de migrations) donne au compte les droits des SID qu'il contient." `
@@ -2801,9 +3088,7 @@ function Invoke-Audit5SidHistory {
     $rows = @(foreach ($o in $objs) {
         foreach ($sid in @($o.sIDHistory)) {
             $s = $sid.Value
-            $eval = if ($s -like "$domainSid-*") { 'CRITIQUE : SID du domaine courant' }
-                    elseif ($s -match '-(500|512|516|518|519|520|498|521)$' -or $s -like 'S-1-5-32-*') { 'CRITIQUE : SID privilegie' }
-                    else { 'A verifier : migration terminee ?' }
+            $eval = Get-SidHistoryRisk -Sid $s -DomainSid $domainSid
             [PSCustomObject]@{ Compte = $o.sAMAccountName; Classe = $o.objectClass; SIDHistory = $s; Evaluation = $eval; DN = $o.DistinguishedName }
         }
     })
@@ -2821,11 +3106,11 @@ function Invoke-Remediate5RemoveSidHistory {
 
     $domainSid = (Get-CachedADDomain).DomainSID.Value
     $entries = @(foreach ($o in @(Get-ADObject -LDAPFilter "(sIDHistory=*)" -Properties sIDHistory, sAMAccountName -ErrorAction SilentlyContinue)) {
-        foreach ($sid in @($o.sIDHistory)) { [PSCustomObject]@{ Compte = $o.sAMAccountName; DN = $o.DistinguishedName; SID = $sid.Value; MemeDomaine = ($sid.Value -like "$domainSid-*") } }
+        foreach ($sid in @($o.sIDHistory)) { [PSCustomObject]@{ Compte = $o.sAMAccountName; DN = $o.DistinguishedName; SID = $sid.Value; Risque = (Get-SidHistoryRisk -Sid $sid.Value -DomainSid $domainSid) } }
     })
     if ($entries.Count -eq 0) { Write-Log "Aucun sIDHistory a supprimer." -Level OK; return }
 
-    $selected = @(Select-FromList -Items $entries -Prompt "Entrees a supprimer" -Display { param($e) "{0} : {1}{2}" -f $e.Compte, $e.SID, $(if ($e.MemeDomaine) { '  <-- SID du domaine courant (CRITIQUE)' } else { '' }) })
+    $selected = @(Select-FromList -Items $entries -Prompt "Entrees a supprimer" -Display { param($e) "{0} : {1}  ({2})" -f $e.Compte, $e.SID, $e.Risque })
     if ($selected.Count -eq 0) { return }
     if (-not (Confirm-Action ("Supprimer {0} entree(s) sIDHistory (irreversible)" -f $selected.Count) -Strong)) { return }
 
@@ -4035,6 +4320,49 @@ function Invoke-Audit9ReplicationAndFsmo {
     } catch { }
 }
 
+function Get-DCOwnership {
+    <#
+        Proprietaire de l'objet ordinateur de chaque DC. Attendu : Domain Admins, Enterprise
+        Admins, Administrateurs ou SYSTEM. Un autre proprietaire (compte ayant pre-cree ou joint
+        le DC) peut modifier l'objet, donc prendre le controle du DC (RBCD, msDS-KeyCredentialLink).
+        Legitime = $null si le proprietaire n'a pas pu etre lu (jamais conclu "conforme").
+    #>
+    $dom = Get-CachedADDomain
+    $sid = $dom.DomainSID.Value
+    $legit = @("$sid-512", "$(Get-RootDomainSid)-519", 'S-1-5-32-544', 'S-1-5-18')
+    return @(foreach ($c in @(Get-ADComputer -LDAPFilter '(|(primaryGroupID=516)(primaryGroupID=521))' -Properties nTSecurityDescriptor -ErrorAction Stop)) {
+        $ownerSid = $null
+        try { $ownerSid = $c.nTSecurityDescriptor.GetOwner([System.Security.Principal.SecurityIdentifier]).Value } catch { }
+        $ownerName = if ($ownerSid) { try { (New-Object System.Security.Principal.SecurityIdentifier($ownerSid)).Translate([System.Security.Principal.NTAccount]).Value } catch { $ownerSid } } else { '(illisible)' }
+        [PSCustomObject]@{
+            DC           = $c.Name
+            Proprietaire = $ownerName
+            SID          = $ownerSid
+            Legitime     = if ($ownerSid) { $legit -contains $ownerSid } else { $null }
+        }
+    })
+}
+
+function Invoke-Audit9DCOwnership {
+    Write-Section "Proprietaires des objets ordinateur des controleurs de domaine" Magenta
+    Write-Info "Le proprietaire d'un objet peut toujours modifier ses permissions. Un DC dont l'objet" `
+               "appartient a un compte non administrateur (compte de jonction, technicien) est un chemin" `
+               "de compromission du domaine. Correction : proprietaire = Admins du domaine."
+    try { $rows = @(Get-DCOwnership) } catch {
+        Write-Log ("Lecture des proprietaires impossible : {0}" -f $_.Exception.Message) -Level ERROR
+        return
+    }
+    foreach ($r in $rows) {
+        $color = if ($r.Legitime -eq $true) { 'Green' } elseif ($r.Legitime -eq $false) { 'Red' } else { 'Yellow' }
+        Write-Host ("  - {0} : proprietaire {1}" -f $r.DC, $r.Proprietaire) -ForegroundColor $color
+    }
+    $bad = @($rows | Where-Object { $_.Legitime -eq $false })
+    if ($bad.Count -gt 0) { Write-Log ("{0} DC appartenant a un principal non administrateur : redonnez la propriete a 'Admins du domaine' (onglet Securite > Avance > Proprietaire)." -f $bad.Count) -Level ERROR }
+    elseif (@($rows | Where-Object { $null -eq $_.Legitime }).Count -gt 0) { Write-Log "Certains proprietaires n'ont pas pu etre lus : resultat incomplet." -Level WARN }
+    else { Write-Log "Tous les objets DC appartiennent a un groupe d'administration." -Level OK }
+    [void](Export-Report -Rows $rows -Name "Rapport_ProprietairesDC")
+}
+
 # ============================================================
 #  THEME 9 - WINDOWS LAPS
 # ============================================================
@@ -4060,16 +4388,23 @@ function Test-LapsSchemaPresent { return (Test-SchemaAttribute -LdapDisplayName 
 
 function Get-LapsCoverage {
     <#
-        Couverture LAPS des ordinateurs ACTIFS hors DC (Windows LAPS ou LAPS legacy), et
+        Couverture LAPS des ordinateurs Windows ACTIFS (Windows LAPS ou LAPS legacy), et
         detection des mots de passe dont l'expiration est depassee de plus de 7 jours : le
         client LAPS ne fonctionne plus sur ces machines (ou elles sont eteintes).
+        Sont EXCLUS du calcul (aucun compte local a gerer -> faux "non couvert") : DC, comptes
+        de service geres (gMSA/MSA), objets de cluster (CNO/VCO), compte AZUREADSSOACC et
+        machines non-Windows. Ils sont comptes a part (propriete Exclus).
     #>
     $winLaps = Test-LapsSchemaPresent
     $legacy = Test-SchemaAttribute -LdapDisplayName 'ms-Mcs-AdmPwdExpirationTime'
-    $props = @('OperatingSystem', 'PrimaryGroupID', 'LastLogonDate')
+    $props = @('OperatingSystem', 'PrimaryGroupID', 'LastLogonDate', 'ServicePrincipalName')
     if ($winLaps) { $props += 'msLAPS-PasswordExpirationTime' }
     if ($legacy) { $props += 'ms-Mcs-AdmPwdExpirationTime' }
-    $computers = @(Get-ADComputer -Filter 'Enabled -eq $true' -Properties $props | Where-Object { $_.PrimaryGroupID -notin 516, 521 })
+    $excluded = @{}
+    $computers = @(Get-ADComputer -Filter 'Enabled -eq $true' -Properties $props | Where-Object {
+        $kind = Get-ComputerAccountKind -Computer $_
+        if ($kind -eq 'Computer') { $true } else { $excluded[$kind] = 1 + [int]$excluded[$kind]; $false }
+    })
     $now = Get-Date
     $rows = @($computers | ForEach-Object {
         $w = if ($winLaps) { ConvertFrom-FileTimeSafe $_.'msLAPS-PasswordExpirationTime' } else { $null }
@@ -4085,7 +4420,7 @@ function Get-LapsCoverage {
             DN                = $_.DistinguishedName
         }
     })
-    return [PSCustomObject]@{ WindowsLapsSchema = $winLaps; LegacySchema = $legacy; Rows = $rows }
+    return [PSCustomObject]@{ WindowsLapsSchema = $winLaps; LegacySchema = $legacy; Rows = $rows; Exclus = $excluded }
 }
 
 function Invoke-Audit10LapsDeployment {
@@ -4102,7 +4437,11 @@ function Invoke-Audit10LapsDeployment {
     $covered = @($rows | Where-Object { $_.LAPS -ne 'Absent' })
     $stale = @($rows | Where-Object { $_.ExpireDepuis7j })
     $pct = [math]::Round(($covered.Count / $rows.Count) * 100, 1)
-    Write-Host ("Couverture LAPS (ordinateurs actifs hors DC) : {0}/{1} ({2} %) - Windows LAPS : {3}, legacy : {4}" -f $covered.Count, $rows.Count, $pct, @($rows | Where-Object LAPS -eq 'Windows LAPS').Count, @($rows | Where-Object LAPS -eq 'LAPS legacy').Count) -ForegroundColor $(if ($pct -ge 95) { 'Green' } else { 'Yellow' })
+    Write-Host ("Couverture LAPS (ordinateurs Windows actifs hors DC) : {0}/{1} ({2} %) - Windows LAPS : {3}, legacy : {4}" -f $covered.Count, $rows.Count, $pct, @($rows | Where-Object LAPS -eq 'Windows LAPS').Count, @($rows | Where-Object LAPS -eq 'LAPS legacy').Count) -ForegroundColor $(if ($pct -ge 95) { 'Green' } else { 'Yellow' })
+    if ($cov.Exclus.Count -gt 0) {
+        $labels = @{ DC = 'DC'; MSA = 'comptes de service geres'; Cluster = 'objets de cluster'; EntraSSO = 'AZUREADSSOACC'; NonWindows = 'non-Windows' }
+        Write-Host ("  Hors perimetre LAPS (non comptes) : {0}" -f (($cov.Exclus.GetEnumerator() | ForEach-Object { "{0} {1}" -f $_.Value, $labels[$_.Key] }) -join ', ')) -ForegroundColor DarkGray
+    }
     if ($stale.Count -gt 0) {
         Write-Log ("{0} machine(s) avec un mot de passe LAPS expire depuis plus de 7 jours : client LAPS en echec (droits d'ecriture, GPO non appliquee) ou machine eteinte." -f $stale.Count) -Level WARN
     }
@@ -5050,53 +5389,74 @@ Suivre le "Active Directory Forest Recovery Guide" de Microsoft pour le detail ;
 #  THEME 14 - OBSOLESCENCE
 # ============================================================
 
+# Table de cycle de vie Microsoft (dates de FIN de support, a confirmer sur
+# https://learn.microsoft.com/lifecycle). Le statut est CALCULE par rapport a la date du jour :
+# il ne se perime plus avec le temps comme une liste de libelles figes.
+#   Os      : regex sur l'attribut operatingSystem
+#   Build   : numero de build exact (0 = toute build)
+#   Ent     : date de fin pour les editions Entreprise/Education (Windows 11) ; Fin sinon
+$Script:OsLifecycle = @(
+    @{ Os = 'Windows (NT|2000|XP|Vista)|Windows 7|Windows 8'; Build = 0; Fin = '2023-01-10'; Label = 'Windows client ancien' }
+    @{ Os = 'Server 2003';                 Build = 0;     Fin = '2015-07-14'; Label = 'Windows Server 2003' }
+    @{ Os = 'Server 2008';                 Build = 0;     Fin = '2020-01-14'; Label = 'Windows Server 2008 / 2008 R2' }
+    @{ Os = 'Server 2012';                 Build = 0;     Fin = '2023-10-10'; Label = 'Windows Server 2012 / 2012 R2 (ESU payantes jusqu''au 13/10/2026)' }
+    @{ Os = 'Server 2016';                 Build = 0;     Fin = '2027-01-12'; Label = 'Windows Server 2016' }
+    @{ Os = 'Server 2019';                 Build = 0;     Fin = '2029-01-09'; Label = 'Windows Server 2019' }
+    @{ Os = 'Server 2022';                 Build = 0;     Fin = '2031-10-14'; Label = 'Windows Server 2022' }
+    @{ Os = 'Server 2025';                 Build = 0;     Fin = '2034-11-14'; Label = 'Windows Server 2025' }
+    @{ Os = 'Windows 10.*LTS[BC]';         Build = 10240; Fin = '2025-10-14'; Label = 'Windows 10 LTSB 2015' }
+    @{ Os = 'Windows 10.*LTS[BC]';         Build = 14393; Fin = '2026-10-13'; Label = 'Windows 10 LTSB 2016' }
+    @{ Os = 'Windows 10.*LTS[BC]';         Build = 17763; Fin = '2029-01-09'; Label = 'Windows 10 LTSC 2019' }
+    @{ Os = 'Windows 10.*IoT.*LTSC';       Build = 19044; Fin = '2032-01-13'; Label = 'Windows 10 IoT LTSC 2021' }
+    @{ Os = 'Windows 10.*LTSC';            Build = 19044; Fin = '2027-01-12'; Label = 'Windows 10 LTSC 2021' }
+    @{ Os = 'Windows 10';                  Build = 0;     Fin = '2025-10-14'; Label = 'Windows 10 (ESU payantes possibles)' }
+    @{ Os = 'Windows 11.*IoT.*LTSC';       Build = 26100; Fin = '2034-10-10'; Label = 'Windows 11 IoT LTSC 2024' }
+    @{ Os = 'Windows 11.*LTSC';            Build = 26100; Fin = '2029-10-09'; Label = 'Windows 11 LTSC 2024' }
+    @{ Os = 'Windows 11';                  Build = 22000; Fin = '2023-10-10'; Ent = '2024-10-08'; Label = 'Windows 11 21H2' }
+    @{ Os = 'Windows 11';                  Build = 22621; Fin = '2024-10-08'; Ent = '2025-10-14'; Label = 'Windows 11 22H2' }
+    @{ Os = 'Windows 11';                  Build = 22631; Fin = '2025-11-11'; Ent = '2026-11-10'; Label = 'Windows 11 23H2' }
+    @{ Os = 'Windows 11';                  Build = 26100; Fin = '2026-10-13'; Ent = '2027-10-12'; Label = 'Windows 11 24H2' }
+    @{ Os = 'Windows 11';                  Build = 26200; Fin = '2027-10-12'; Ent = '2028-10-10'; Label = 'Windows 11 25H2' }
+)
+
 function Get-OsSupportStatus {
     <#
         Statut de support d'un OS d'apres son libelle et son numero de build (attributs AD
-        operatingSystem / operatingSystemVersion). Table de reference arretee en 2026 :
-        a mettre a jour, et a confirmer sur https://learn.microsoft.com/lifecycle avant action.
+        operatingSystem / operatingSystemVersion), CALCULE a la date du jour (-Today pour les
+        tests) : EOL (fin depassee), BIENTOT (fin dans moins d'un an), SUPPORTE ou INCONNU.
+        Editions Entreprise/Education de Windows 11 : calendrier etendu pris en compte.
     #>
-    param([string]$OS, [string]$Version)
-    if ([string]::IsNullOrWhiteSpace($OS)) { return [PSCustomObject]@{ Statut = 'INCONNU'; Detail = 'Attribut operatingSystem vide' } }
+    param([string]$OS, [string]$Version, [datetime]$Today = (Get-Date))
+    if ([string]::IsNullOrWhiteSpace($OS)) { return [PSCustomObject]@{ Statut = 'INCONNU'; Detail = 'Attribut operatingSystem vide'; FinSupport = $null } }
     $build = 0
     if ($Version -match '\((\d+)\)') { $build = [int]$Matches[1] }
-    $eol = { param($d) [PSCustomObject]@{ Statut = 'EOL'; Detail = $d } }
-    $soon = { param($d) [PSCustomObject]@{ Statut = 'BIENTOT'; Detail = $d } }
-    $ok = { param($d) [PSCustomObject]@{ Statut = 'SUPPORTE'; Detail = $d } }
+    $isEnt = $OS -match 'Enterprise|Entreprise|Education|Éducation'
 
-    switch -Regex ($OS) {
-        'Windows (NT|2000|XP|Vista)|Windows 7|Windows 8' { return (& $eol 'Fin de support depassee') }
-        'Server 2003|Server 2008|Server 2012' { return (& $eol 'Fin de support depassee (ESU 2012 : 13/10/2026 au plus tard)') }
-        'Server 2016' { return (& $soon 'Fin du support etendu le 12/01/2027') }
-        'Server 2019' { return (& $ok 'Support etendu jusqu''au 09/01/2029') }
-        'Server 2022|Server 2025' { return (& $ok 'Supporte') }
-        'Windows 10' {
-            if ($OS -match 'LTS[BC]') {
-                if ($build -eq 17763) { return (& $ok 'LTSC 2019 : support jusqu''au 09/01/2029') }
-                if ($build -eq 19044) { return (& $soon 'LTSC 2021 : fin de support le 12/01/2027') }
-                if ($build -eq 14393) { return (& $soon 'LTSB 2016 : fin de support le 13/10/2026') }
-                return (& $eol 'LTSB ancienne : fin de support depassee')
-            }
-            return (& $eol 'Fin de support le 14/10/2025 (ESU payantes possibles)')
-        }
-        'Windows 11' {
-            if ($build -gt 0 -and $build -lt 22631) { return (& $eol ("Version de Windows 11 (build {0}) hors support" -f $build)) }
-            if ($build -eq 22631) { return (& $soon '23H2 : Famille/Pro hors support, Entreprise/Education jusqu''au 10/11/2026') }
-            return (& $ok 'Supporte (verifier la version)')
-        }
+    $entry = $Script:OsLifecycle | Where-Object { $OS -match $_.Os -and ($_.Build -eq 0 -or $_.Build -eq $build) } | Select-Object -First 1
+    if (-not $entry) {
+        if ($OS -match 'Windows 11' -and $build -gt 26200) { return [PSCustomObject]@{ Statut = 'SUPPORTE'; Detail = ("Windows 11 build {0} (version recente, non referencee)" -f $build); FinSupport = $null } }
+        if ($OS -match 'Windows 11' -and $build -gt 0) { return [PSCustomObject]@{ Statut = 'EOL'; Detail = ("Windows 11 build {0} (pre-version ou version ancienne)" -f $build); FinSupport = $null } }
+        return [PSCustomObject]@{ Statut = 'INCONNU'; Detail = 'OS non reference (non-Windows, build absente ou libelle inattendu)'; FinSupport = $null }
     }
-    return [PSCustomObject]@{ Statut = 'INCONNU'; Detail = 'OS non reference (non-Windows ou libelle inattendu)' }
+    $endText = if ($isEnt -and $entry.Ent) { $entry.Ent } else { $entry.Fin }
+    $end = [datetime]::ParseExact($endText, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+    $edition = if ($entry.Ent) { if ($isEnt) { ' (Entreprise/Education)' } else { ' (Famille/Pro)' } } else { '' }
+    $statut = if ($end -lt $Today.Date) { 'EOL' } elseif ($end -lt $Today.Date.AddDays(365)) { 'BIENTOT' } else { 'SUPPORTE' }
+    $verb = if ($statut -eq 'EOL') { 'fin de support depassee depuis le' } else { 'fin de support le' }
+    return [PSCustomObject]@{ Statut = $statut; Detail = ("{0}{1} : {2} {3:dd/MM/yyyy}" -f $entry.Label, $edition, $verb, $end); FinSupport = $end }
 }
 
 function Invoke-Audit18UnsupportedOS {
     Write-Section "Inventaire des systemes d'exploitation non/bientot non supportes" Magenta
-    Write-Info "Statut calcule d'apres le libelle ET le numero de build (LTSC, versions Windows 11)." `
-               "Dates de reference integrees au script : a confirmer sur le site Lifecycle Microsoft."
+    Write-Info "Statut calcule a la date du jour d'apres le libelle, le numero de build (LTSC, versions" `
+               "Windows 11) et l'edition. BIENTOT = fin de support dans moins d'un an. Dates de reference" `
+               "integrees au script (table `$Script:OsLifecycle) : a confirmer sur le site Lifecycle Microsoft."
 
-    $computers = @(Get-ADComputer -Filter 'Enabled -eq $true' -Properties OperatingSystem, OperatingSystemVersion, DNSHostName, LastLogonDate)
+    # Les comptes de service geres (gMSA...) sont renvoyes par Get-ADComputer mais n'ont pas d'OS.
+    $computers = @(Get-ADComputer -Filter 'Enabled -eq $true' -Properties OperatingSystem, OperatingSystemVersion, DNSHostName, LastLogonDate | Where-Object { (Get-ComputerAccountKind -Computer $_) -ne 'MSA' })
     $rows = @($computers | ForEach-Object {
         $st = Get-OsSupportStatus -OS $_.OperatingSystem -Version $_.OperatingSystemVersion
-        [PSCustomObject]@{ Name = $_.Name; DNSHostName = $_.DNSHostName; OperatingSystem = $_.OperatingSystem; Version = $_.OperatingSystemVersion; DerniereConnexion = $_.LastLogonDate; Statut = $st.Statut; Detail = $st.Detail }
+        [PSCustomObject]@{ Name = $_.Name; DNSHostName = $_.DNSHostName; OperatingSystem = $_.OperatingSystem; Version = $_.OperatingSystemVersion; DerniereConnexion = $_.LastLogonDate; Statut = $st.Statut; FinSupport = $st.FinSupport; Detail = $st.Detail }
     })
     foreach ($s in 'EOL', 'BIENTOT', 'INCONNU', 'SUPPORTE') {
         $sub = @($rows | Where-Object Statut -eq $s)
@@ -5154,7 +5514,7 @@ function Invoke-Remediate18GenerateTreatmentPlan {
     if (-not (Confirm-Action "Lancer la consolidation du plan de traitement de l'obsolescence")) { return }
     $rows = [System.Collections.Generic.List[object]]::new()
 
-    foreach ($c in @(Get-ADComputer -Filter 'Enabled -eq $true' -Properties OperatingSystem, OperatingSystemVersion)) {
+    foreach ($c in @(Get-ADComputer -Filter 'Enabled -eq $true' -Properties OperatingSystem, OperatingSystemVersion | Where-Object { (Get-ComputerAccountKind -Computer $_) -ne 'MSA' })) {
         $st = Get-OsSupportStatus -OS $c.OperatingSystem -Version $c.OperatingSystemVersion
         if ($st.Statut -in 'EOL', 'BIENTOT') {
             $rows.Add([PSCustomObject]@{ Priorite = $(if ($st.Statut -eq 'EOL') { 1 } else { 2 }); Categorie = "OS $($st.Statut)"; Element = $c.Name; Detail = "$($c.OperatingSystem) - $($st.Detail)" })
@@ -5432,7 +5792,9 @@ function Get-InactiveAccountCandidates {
           - exclut un compte dont le mot de passe a change apres la date seuil (pour un
             ordinateur, le mot de passe machine est renouvele tous les 30 j tant qu'il vit) ;
           - exclut comptes d'approbation (trusts), DC/RODC, objets de cluster (CNO/VCO),
-            comptes systeme et membres des groupes exclus, UO exclues, UO de quarantaine.
+            comptes de service geres (gMSA/MSA/dMSA : renvoyes par Get-ADComputer), compte
+            Entra Seamless SSO (AZUREADSSOACC$, jamais "connecte" mais indispensable), comptes
+            krbtgt*, comptes systeme et membres des groupes exclus, UO exclues, quarantaine.
         Chaque objet porte la raison d'exclusion eventuelle (colonne Exclusion) pour l'audit.
     #>
     param(
@@ -5453,13 +5815,17 @@ function Get-InactiveAccountCandidates {
         $llt = ConvertFrom-FileTimeSafe $o.lastLogonTimestamp
         $pls = ConvertFrom-FileTimeSafe $o.pwdLastSet
         $reason = $null
+        $kind = if ($Type -eq 'Computer') { Get-ComputerAccountKind -Computer $o } else { 'User' }
         if ($ProtectedSids -and $ProtectedSids.Contains($o.SID.Value)) { $reason = 'compte protege (systeme / groupe exclu)' }
-        elseif ($Type -eq 'Computer' -and (($o.primaryGroupID -in 516, 521) -or ($ProtectedComputerDNs -and $ProtectedComputerDNs.Contains($o.DistinguishedName)))) { $reason = 'controleur de domaine' }
+        elseif ($kind -eq 'DC' -or ($ProtectedComputerDNs -and $ProtectedComputerDNs.Contains($o.DistinguishedName))) { $reason = 'controleur de domaine' }
+        elseif ($kind -eq 'MSA') { $reason = 'compte de service gere (gMSA/MSA/dMSA)' }
+        elseif ($kind -eq 'EntraSSO') { $reason = 'compte Entra Seamless SSO (AZUREADSSOACC)' }
+        elseif ($o.SamAccountName -like 'krbtgt*') { $reason = 'compte krbtgt' }
         elseif (Test-DNUnderAny -DN $o.DistinguishedName -Containers $QuarantineOUs) { $reason = 'deja en quarantaine' }
         elseif (Test-DNUnderAny -DN $o.DistinguishedName -Containers $ExcludedOUs) { $reason = 'UO exclue' }
         elseif ($o.whenCreated -gt $Cutoff) { $reason = 'cree apres la date seuil' }
         elseif ($pls -and $pls -gt $Cutoff) { $reason = 'mot de passe change apres la date seuil (activite recente)' }
-        elseif ($Type -eq 'Computer' -and (@($o.servicePrincipalName) -match '^MSClusterVirtualServer/').Count -gt 0) { $reason = 'objet de cluster (CNO/VCO)' }
+        elseif ($kind -eq 'Cluster') { $reason = 'objet de cluster (CNO/VCO)' }
 
         [PSCustomObject]@{
             SamAccountName    = $o.SamAccountName
@@ -5705,6 +6071,9 @@ function Invoke-Pass {
         $pls = ConvertFrom-FT $o.pwdLastSet
         if ($protected.Contains($o.SID.Value)) { continue }
         if ($o.primaryGroupID -in 516, 521) { continue }
+        # Comptes de service geres (derivent de 'computer'), Seamless SSO, krbtgt* : jamais traites.
+        if ([string]$o.ObjectClass -in 'msDS-GroupManagedServiceAccount', 'msDS-ManagedServiceAccount', 'msDS-DelegatedManagedServiceAccount') { continue }
+        if ($o.SamAccountName -ieq 'AZUREADSSOACC$' -or $o.SamAccountName -like 'krbtgt*') { continue }
         if (Test-Under $o.DistinguishedName $quarantine) { continue }
         if (Test-Under $o.DistinguishedName $ExcludedOUs) { continue }
         if ($o.whenCreated -gt $cutoff) { continue }
@@ -5994,7 +6363,8 @@ function Invoke-QuickDiagnostic {
         & $add 'Resilience' 'Derniere sauvegarde AD' $st $(if ($b.DerniereSauvegarde) { "$($b.AgeJours) jour(s)" } else { 'Jamais' }) 'Sauvegarde System State quotidienne, hors domaine, testee' '13.3'
     }
     & $def 'Resilience' 'Nombre de controleurs de domaine' '8.12' {
-        $n = @(Get-DomainControllersList | Where-Object { -not $_.IsReadOnly }).Count
+        # -Strict : une erreur de lecture donne ERREUR, jamais "0 DC".
+        $n = @(Get-DomainControllersList -Refresh -Strict | Where-Object { -not $_.IsReadOnly }).Count
         & $add 'Resilience' 'Nombre de DC inscriptibles' $(if ($n -lt 2) { 'ALERTE' } else { 'OK' }) $n 'Au moins 2 DC inscriptibles par domaine' '8.12'
     }
     & $def 'Resilience' 'Sante de la replication' '8.12' {
@@ -6073,12 +6443,13 @@ function Invoke-QuickDiagnostic {
     & $def 'Kerberos' 'Comptes Kerberoastables' '2.8' {
         $aes = Get-AesKeysIntroductionDate
         $acc = @(Get-ADUser -LDAPFilter "(&(servicePrincipalName=*)(!(sAMAccountName=krbtgt*))$uacDisabled)" -Properties PasswordLastSet, 'msDS-SupportedEncryptionTypes')
-        $weak = @($acc | Where-Object { (-not (Test-HasAesEncryptionType $_.'msDS-SupportedEncryptionTypes') -or ($aes -and $_.PasswordLastSet -lt $aes)) -and $_.PasswordLastSet -lt $now.AddYears(-1) })
+        # pwdLastSet vide (mot de passe a changer a la prochaine connexion) : non compte ici.
+        $weak = @($acc | Where-Object { $_.PasswordLastSet -and (-not (Test-HasAesEncryptionType $_.'msDS-SupportedEncryptionTypes') -or ($aes -and $_.PasswordLastSet -lt $aes)) -and $_.PasswordLastSet -lt $now.AddYears(-1) })
         & $add 'Kerberos' 'Comptes avec SPN, RC4 et mot de passe > 1 an' $(if ($weak.Count) { 'ALERTE' } else { 'OK' }) ("{0} / {1} comptes avec SPN" -f $weak.Count, $acc.Count) 'Mot de passe long + AES, ou gMSA' '2.8'
     }
     & $def 'Kerberos' 'sIDHistory' '4.10' {
         $objs = @(Get-ADObject -LDAPFilter "(sIDHistory=*)" -Properties sIDHistory)
-        $crit = @($objs | Where-Object { @($_.sIDHistory | Where-Object { $_.Value -like "$sid-*" -or $_.Value -match '-(500|512|518|519)$' }).Count -gt 0 })
+        $crit = @($objs | Where-Object { @($_.sIDHistory | Where-Object { (Get-SidHistoryRisk -Sid $_.Value -DomainSid $sid) -like 'CRITIQUE*' }).Count -gt 0 })
         $st = if ($crit.Count) { 'CRITIQUE' } elseif ($objs.Count) { 'INFO' } else { 'OK' }
         & $add 'Kerberos' 'Objets avec sIDHistory (dont dangereux)' $st ("{0} (dont {1} dangereux)" -f $objs.Count, $crit.Count) 'Supprimer les sIDHistory apres migration' '4.11'
     }
@@ -6108,9 +6479,9 @@ function Invoke-QuickDiagnostic {
         if (-not (Test-Path -LiteralPath $root)) { throw "SYSVOL inaccessible ($root)" }
         $n = 0
         foreach ($f in @(Get-ChildItem -LiteralPath $root -Recurse -Include 'Groups.xml', 'Services.xml', 'ScheduledTasks.xml', 'DataSources.xml', 'Printers.xml', 'Drives.xml' -File -ErrorAction Stop)) {
-            if ((Get-Content -LiteralPath $f.FullName -Raw -ErrorAction SilentlyContinue) -match 'cpassword="[^"]+"') { $n++ }
+            $n += @(Get-GppPasswordEntries -Content (Get-Content -LiteralPath $f.FullName -Raw -ErrorAction Stop)).Count
         }
-        & $add 'Mots de passe' 'Fichiers GPP contenant un mot de passe (cpassword)' $(if ($n) { 'CRITIQUE' } else { 'OK' }) $n 'Supprimer et changer les mots de passe exposes' '3.7'
+        & $add 'Mots de passe' 'Mots de passe GPP (cpassword) dans SYSVOL' $(if ($n) { 'CRITIQUE' } else { 'OK' }) $n 'Supprimer et changer les mots de passe exposes' '3.7'
     }
     & $def 'LDAP' 'dSHeuristics' '7.6' {
         $d = Get-DsHeuristicsState
@@ -6129,25 +6500,59 @@ function Invoke-QuickDiagnostic {
             if ($stale) { & $add 'LAPS' 'Mots de passe LAPS expires depuis > 7 jours' 'ALERTE' $stale 'Verifier le client LAPS / droits d''ecriture' '9.1' }
         }
     }
-    & $def 'Hygiene' 'Comptes inactifs' '17.1' {
+    & $def 'Hygiene' 'Comptes inactifs' '18.1' {
         $prot = Get-AlwaysProtectedPrincipalSids
         $u = @(Get-InactiveAccountCandidates -Type User -Cutoff $now.AddDays(-180) -ProtectedSids $prot | Where-Object { -not $_.Exclusion }).Count
         $c = @(Get-InactiveAccountCandidates -Type Computer -Cutoff $now.AddDays(-90) -ProtectedSids $prot -ProtectedComputerDNs (Get-ProtectedDCComputerDNs) | Where-Object { -not $_.Exclusion }).Count
         $tu = @(Get-ADUser -LDAPFilter "(&(objectCategory=person)$uacDisabled)" -ResultSetSize $null).Count
-        $tc = @(Get-ADComputer -LDAPFilter $uacDisabled -ResultSetSize $null).Count
+        # Denominateur coherent avec les candidats : ni DC, ni gMSA, ni cluster, ni AZUREADSSOACC.
+        $tc = @(Get-ADComputer -LDAPFilter $uacDisabled -Properties PrimaryGroupID, ServicePrincipalName, OperatingSystem -ResultSetSize $null | Where-Object { (Get-ComputerAccountKind -Computer $_) -in 'Computer', 'NonWindows' }).Count
         $pu = if ($tu) { [math]::Round(100 * $u / $tu, 1) } else { 0 }
         $pc = if ($tc) { [math]::Round(100 * $c / $tc, 1) } else { 0 }
         & $add 'Hygiene' 'Utilisateurs actifs inactifs > 180 j' $(if ($pu -gt 10) { 'ALERTE' } elseif ($u) { 'INFO' } else { 'OK' }) "$u ($pu %)" 'Desactiver apres revue' '18.1'
         & $add 'Hygiene' 'Ordinateurs actifs inactifs > 90 j' $(if ($pc -gt 10) { 'ALERTE' } elseif ($c) { 'INFO' } else { 'OK' }) "$c ($pc %)" 'Desactiver apres revue' '18.1'
     }
     & $def 'Obsolescence' 'Systemes hors support' '14.1' {
-        $eol = @(Get-ADComputer -Filter 'Enabled -eq $true' -Properties OperatingSystem, OperatingSystemVersion, PrimaryGroupID | ForEach-Object {
+        $eol = @(Get-ADComputer -Filter 'Enabled -eq $true' -Properties OperatingSystem, OperatingSystemVersion, PrimaryGroupID | Where-Object { (Get-ComputerAccountKind -Computer $_) -ne 'MSA' } | ForEach-Object {
             $st = Get-OsSupportStatus -OS $_.OperatingSystem -Version $_.OperatingSystemVersion
             if ($st.Statut -eq 'EOL') { [PSCustomObject]@{ DC = ($_.PrimaryGroupID -in 516, 521) } }
         })
         $dcEol = @($eol | Where-Object DC).Count
         $st = if ($dcEol) { 'CRITIQUE' } elseif ($eol.Count) { 'ALERTE' } else { 'OK' }
         & $add 'Obsolescence' 'Ordinateurs actifs sur un OS hors support' $st ("{0} (dont {1} DC)" -f $eol.Count, $dcEol) 'Migrer / isoler' '14.3'
+    }
+    & $def 'Privileges' 'Controle de la racine du domaine (DCSync)' '1.15' {
+        $r = @(Get-DomainRootDangerousAces)
+        $unexpected = @($r | Where-Object { -not $_.SynchroEntraProbable })
+        $st = if ($unexpected.Count) { 'CRITIQUE' } elseif ($r.Count) { 'ALERTE' } else { 'OK' }
+        $val = if ($r.Count) { ($r | Select-Object -First 3 | ForEach-Object { $_.Principal }) -join ', ' } else { 'Aucun principal non standard' }
+        & $add 'Privileges' 'Principaux non standard avec DCSync / controle de la racine' $st $val 'Retirer ces droits ; proteger le compte Entra Connect en tier 0' '1.15'
+    }
+    & $def 'Privileges' 'Proprietaires des objets DC' '8.13' {
+        $o = @(Get-DCOwnership)
+        $bad = @($o | Where-Object { $_.Legitime -eq $false })
+        if (@($o | Where-Object { $null -eq $_.Legitime }).Count -gt 0 -and $bad.Count -eq 0) { throw "Proprietaire illisible sur au moins un DC." }
+        & $add 'Privileges' 'DC appartenant a un principal non administrateur' $(if ($bad.Count) { 'CRITIQUE' } else { 'OK' }) $bad.Count "Proprietaire = 'Admins du domaine'" '8.13'
+    }
+    & $def 'Privileges' 'Groupe principal non standard' '1.17' {
+        $r = @(Get-NonStandardPrimaryGroupAccounts)
+        $crit = @($r | Where-Object { $_.Evaluation -like 'CRITIQUE*' })
+        & $add 'Privileges' 'Comptes au groupe principal non standard (dont privilegie)' $(if ($crit.Count) { 'CRITIQUE' } elseif ($r.Count) { 'INFO' } else { 'OK' }) ("{0} (dont {1} privilegie(s))" -f $r.Count, $crit.Count) 'Remettre le groupe principal par defaut' '1.17'
+    }
+    & $def 'Privileges' 'Comptes a privileges inactifs/desactives' '1.16' {
+        $r = @(Get-PrivilegedAccountsHygiene -Days 180)
+        $dis = @($r | Where-Object { -not $_.Actif }).Count
+        $ina = $r.Count - $dis
+        & $add 'Privileges' 'Comptes a privileges inactifs > 180 j (actifs)' $(if ($ina) { 'ALERTE' } else { 'OK' }) $ina 'Retirer des groupes puis desactiver' '1.16'
+        & $add 'Privileges' 'Comptes desactives encore membres de groupes a privileges' $(if ($dis) { 'INFO' } else { 'OK' }) $dis 'Retirer des groupes a privileges' '1.16'
+    }
+    & $def 'Mots de passe' "Mots de passe n'expirant jamais" '3.1' {
+        $n = @(Get-ADUser -LDAPFilter "(&(objectCategory=person)(userAccountControl:1.2.840.113556.1.4.803:=65536)$uacDisabled)" -ResultSetSize $null).Count
+        & $add 'Mots de passe' "Utilisateurs actifs au mot de passe n'expirant jamais" $(if ($n) { 'INFO' } else { 'OK' }) $n 'Limiter aux comptes justifies (gMSA pour les services)' '3.1'
+    }
+    & $def 'Mots de passe' 'Mots de passe dans description/notes' '3.10' {
+        $n = @(Get-PasswordInDescriptionCandidates).Count
+        & $add 'Mots de passe' 'Motifs de mot de passe dans description/notes (heuristique)' $(if ($n) { 'ALERTE' } else { 'OK' }) $n 'Effacer et changer les mots de passe concernes' '3.10'
     }
 
     $i = 0
@@ -6165,38 +6570,190 @@ function Invoke-QuickDiagnostic {
 
     $order = @{ 'CRITIQUE' = 0; 'ALERTE' = 1; 'ERREUR' = 2; 'INFO' = 3; 'OK' = 4 }
     $sorted = @($findings | Sort-Object @{ E = { $order[$_.Statut] } }, Categorie, Controle)
-    Show-DiagnosticTable -Findings $sorted
-    $Script:LastDiagnostic = [PSCustomObject]@{ Date = Get-Date; Findings = $sorted }
+
+    # Evolution par rapport au diagnostic precedent du MEME domaine (historique Logs\Diagnostics).
+    $previous = @(Get-DiagnosticSnapshots -Domain $dom.DNSRoot) | Select-Object -Last 1
+    Compare-DiagnosticFindings -Current $sorted -Previous $(if ($previous) { $previous.Findings } else { $null })
+    $Script:PreviousDiagnostic = $previous
+    $Script:LastDiagnostic = [PSCustomObject]@{ Date = Get-Date; Findings = $sorted; Score = (Get-DiagnosticScore -Findings $sorted) }
+
+    Show-DiagnosticTable -Findings $sorted -Previous $previous
+    Save-DiagnosticSnapshot -Diagnostic $Script:LastDiagnostic -Domain $dom.DNSRoot
     [void](Export-Report -Rows $sorted -Name "Diagnostic_Rapide")
 }
 
-function Show-DiagnosticTable {
-    param([Parameter(Mandatory)][object[]]$Findings)
-    $colors = @{ 'CRITIQUE' = 'Red'; 'ALERTE' = 'Yellow'; 'ERREUR' = 'Magenta'; 'INFO' = 'Cyan'; 'OK' = 'Green' }
-    Write-Host ""
-    Write-Host ("{0,-9} {1,-14} {2,-58} {3,-22} {4}" -f 'STATUT', 'CATEGORIE', 'CONTROLE', 'VALEUR', 'MENU') -ForegroundColor White
-    Write-Host ("-" * 112) -ForegroundColor DarkGray
-    foreach ($f in $Findings) {
-        $ctl = if ($f.Controle.Length -gt 58) { $f.Controle.Substring(0, 55) + '...' } else { $f.Controle }
-        $val = if ($f.Valeur.Length -gt 22) { $f.Valeur.Substring(0, 19) + '...' } else { $f.Valeur }
-        Write-Host ("{0,-9} " -f $f.Statut) -ForegroundColor $colors[$f.Statut] -NoNewline
-        Write-Host ("{0,-14} {1,-58} {2,-22} {3}" -f $f.Categorie, $ctl, $val, $f.Menu)
+function Get-DiagnosticScore {
+    # Indice indicatif : 100 - 10 par constat critique - 3 par alerte (borne a 0). Pas le score PingCastle.
+    param([AllowEmptyCollection()][object[]]$Findings)
+    $crit = @($Findings | Where-Object { $_.Statut -eq 'CRITIQUE' }).Count
+    $warn = @($Findings | Where-Object { $_.Statut -eq 'ALERTE' }).Count
+    return [Math]::Max(0, 100 - 10 * $crit - 3 * $warn)
+}
+
+function Compare-DiagnosticFindings {
+    <#
+        Ajoute a chaque constat courant les proprietes Precedent (statut au diagnostic precedent)
+        et Evolution : Degrade / Ameliore / Inchange / Nouveau controle / Non verifie.
+        Sans diagnostic precedent, Evolution reste vide.
+    #>
+    param([AllowEmptyCollection()][object[]]$Current, [AllowNull()][object[]]$Previous)
+    $rank = @{ 'OK' = 0; 'INFO' = 1; 'ALERTE' = 2; 'CRITIQUE' = 3 }
+    $prev = @{}
+    foreach ($p in @($Previous | Where-Object { $_ })) { $prev[("{0}|{1}" -f $p.Categorie, $p.Controle)] = $p }
+    foreach ($c in $Current) {
+        $p = $prev[("{0}|{1}" -f $c.Categorie, $c.Controle)]
+        $evo = if (-not $Previous) { $null }
+               elseif (-not $p) { 'Nouveau controle' }
+               elseif ($c.Statut -eq 'ERREUR' -or $p.Statut -eq 'ERREUR') { 'Non verifie' }
+               elseif ($rank[$c.Statut] -gt $rank[$p.Statut]) { 'Degrade' }
+               elseif ($rank[$c.Statut] -lt $rank[$p.Statut]) { 'Ameliore' }
+               else { 'Inchange' }
+        $c | Add-Member -NotePropertyName Precedent -NotePropertyValue $(if ($p) { $p.Statut } else { $null }) -Force
+        $c | Add-Member -NotePropertyName Evolution -NotePropertyValue $evo -Force
     }
-    Write-Host ("-" * 112) -ForegroundColor DarkGray
+}
+
+function Get-SafeFileName { param([string]$Text) return ($Text -replace '[^A-Za-z0-9_.-]', '_') }
+
+function Save-DiagnosticSnapshot {
+    # Historique JSON (Logs\Diagnostics) : sert au suivi d'evolution et a la courbe du rapport HTML.
+    param([Parameter(Mandatory)]$Diagnostic, [Parameter(Mandatory)][string]$Domain)
+    try {
+        if (-not (Test-Path -LiteralPath $Script:DiagHistoryDir)) { New-Item -Path $Script:DiagHistoryDir -ItemType Directory -Force | Out-Null }
+        $path = Join-Path $Script:DiagHistoryDir ("Diagnostic_{0}_{1:yyyyMMdd_HHmmss}.json" -f (Get-SafeFileName $Domain), $Diagnostic.Date)
+        [PSCustomObject]@{
+            Domaine  = $Domain
+            Date     = $Diagnostic.Date.ToString('yyyy-MM-ddTHH:mm:ss')
+            Score    = $Diagnostic.Score
+            Version  = $Script:Version
+            Findings = @($Diagnostic.Findings | Select-Object Categorie, Controle, Statut, Valeur, Recommandation, Menu)
+        } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $path -Encoding UTF8 -ErrorAction Stop
+    } catch {
+        Write-Log ("Historique du diagnostic non enregistre : {0}" -f $_.Exception.Message) -Level WARN
+    }
+}
+
+function Get-DiagnosticSnapshots {
+    # Diagnostics precedents du domaine, du plus ancien au plus recent. Fichier illisible = ignore.
+    param([Parameter(Mandatory)][string]$Domain)
+    if (-not (Test-Path -LiteralPath $Script:DiagHistoryDir)) { return @() }
+    $files = @(Get-ChildItem -LiteralPath $Script:DiagHistoryDir -Filter ("Diagnostic_{0}_*.json" -f (Get-SafeFileName $Domain)) -File -ErrorAction SilentlyContinue | Sort-Object Name)
+    return @(foreach ($f in $files) {
+        try {
+            $j = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
+            [PSCustomObject]@{
+                # PowerShell 7 convertit deja les dates ISO en [datetime] ; 5.1 les laisse en texte.
+                Date     = if ($j.Date -is [datetime]) { $j.Date } else { [datetime]::ParseExact([string]$j.Date, 'yyyy-MM-ddTHH:mm:ss', [Globalization.CultureInfo]::InvariantCulture) }
+                Score    = [int]$j.Score
+                Findings = @($j.Findings)
+                Fichier  = $f.FullName
+            }
+        } catch { Write-Verbose ("Historique illisible ignore : {0}" -f $f.FullName) }
+    })
+}
+
+function Invoke-DiagnosticHistory {
+    Write-Section "Historique des diagnostics (evolution de l'indice et des constats)" Magenta
+    Write-Info "Chaque diagnostic rapide (menu D, 16.3, -QuickAudit) est archive dans Logs\Diagnostics." `
+               "Planifier '-QuickAudit' (tache hebdomadaire) donne un suivi regulier de l'hygiene AD."
+    $dom = Get-CachedADDomain
+    $snaps = @(Get-DiagnosticSnapshots -Domain $dom.DNSRoot)
+    if ($snaps.Count -eq 0) { Write-Log "Aucun diagnostic archive pour ce domaine : lancez d'abord le diagnostic rapide ([D])." -Level INFO; return }
+    $rows = @(foreach ($sn in $snaps) {
+        $f = @($sn.Findings)
+        [PSCustomObject]@{
+            Date      = $sn.Date
+            Indice    = $sn.Score
+            Critiques = @($f | Where-Object { $_.Statut -eq 'CRITIQUE' }).Count
+            Alertes   = @($f | Where-Object { $_.Statut -eq 'ALERTE' }).Count
+            Erreurs   = @($f | Where-Object { $_.Statut -eq 'ERREUR' }).Count
+        }
+    })
+    foreach ($r in ($rows | Select-Object -Last 20)) {
+        $bar = '#' * [int]([Math]::Round($r.Indice / 5))
+        $color = if ($r.Indice -ge 80) { 'Green' } elseif ($r.Indice -ge 50) { 'Yellow' } else { 'Red' }
+        Write-Host ("  {0:dd/MM/yyyy HH:mm}  {1,3}/100 " -f $r.Date, $r.Indice) -NoNewline
+        Write-Host ("{0,-20}" -f $bar) -ForegroundColor $color -NoNewline
+        Write-Host ("  {0} critique(s), {1} alerte(s), {2} erreur(s)" -f $r.Critiques, $r.Alertes, $r.Erreurs) -ForegroundColor DarkGray
+    }
+    if ($rows.Count -ge 2) {
+        $delta = $rows[-1].Indice - $rows[0].Indice
+        Write-Log ("Evolution depuis le {0:dd/MM/yyyy} : {1}{2} point(s) d'indice." -f $rows[0].Date, $(if ($delta -ge 0) { '+' } else { '' }), $delta) -Level $(if ($delta -ge 0) { 'OK' } else { 'WARN' })
+    }
+    [void](Export-Report -Rows $rows -Name "Historique_Diagnostics")
+}
+
+function Show-DiagnosticTable {
+    param([Parameter(Mandatory)][object[]]$Findings, $Previous)
+    $colors = @{ 'CRITIQUE' = 'Red'; 'ALERTE' = 'Yellow'; 'ERREUR' = 'Magenta'; 'INFO' = 'Cyan'; 'OK' = 'Green' }
+    $evoText = @{ 'Degrade' = 'PIRE'; 'Ameliore' = 'MIEUX'; 'Nouveau controle' = 'NOUV.'; 'Non verifie' = '?'; 'Inchange' = '=' }
+    $evoColor = @{ 'Degrade' = 'Red'; 'Ameliore' = 'Green'; 'Nouveau controle' = 'Cyan'; 'Non verifie' = 'Magenta'; 'Inchange' = 'DarkGray' }
+    Write-Host ""
+    Write-Host ("{0,-9} {1,-6} {2,-14} {3,-54} {4,-22} {5}" -f 'STATUT', 'EVOL.', 'CATEGORIE', 'CONTROLE', 'VALEUR', 'MENU') -ForegroundColor White
+    Write-Host ("-" * 114) -ForegroundColor DarkGray
+    $lastStatus = $null
+    foreach ($f in $Findings) {
+        # Ligne vide entre deux niveaux de gravite : lecture plus rapide.
+        if ($lastStatus -and $f.Statut -ne $lastStatus) { Write-Host "" }
+        $lastStatus = $f.Statut
+        $ctl = if ($f.Controle.Length -gt 54) { $f.Controle.Substring(0, 51) + '...' } else { $f.Controle }
+        $val = if ($f.Valeur.Length -gt 22) { $f.Valeur.Substring(0, 19) + '...' } else { $f.Valeur }
+        $evo = if ($f.PSObject.Properties['Evolution'] -and $f.Evolution) { $f.Evolution } else { $null }
+        Write-Host ("{0,-9} " -f $f.Statut) -ForegroundColor $colors[$f.Statut] -NoNewline
+        Write-Host ("{0,-6} " -f $(if ($evo) { $evoText[$evo] } else { '' })) -ForegroundColor $(if ($evo) { $evoColor[$evo] } else { 'Gray' }) -NoNewline
+        Write-Host ("{0,-14} {1,-54} {2,-22} {3}" -f $f.Categorie, $ctl, $val, $f.Menu)
+    }
+    Write-Host ("-" * 114) -ForegroundColor DarkGray
     $summary = $Findings | Group-Object Statut | ForEach-Object { "{0} : {1}" -f $_.Name, $_.Count }
     Write-Host ("Synthese : {0}" -f ($summary -join '  |  ')) -ForegroundColor White
-    $crit = @($Findings | Where-Object Statut -eq 'CRITIQUE').Count
-    $warn = @($Findings | Where-Object Statut -eq 'ALERTE').Count
-    $score = [Math]::Max(0, 100 - 10 * $crit - 3 * $warn)
+    $score = Get-DiagnosticScore -Findings $Findings
     Write-Host ("Indice indicatif d'hygiene : {0}/100 (-10 par critique, -3 par alerte ; ce n'est PAS le score PingCastle)." -f $score) -ForegroundColor $(if ($score -ge 80) { 'Green' } elseif ($score -ge 50) { 'Yellow' } else { 'Red' })
-    Write-Host "La colonne MENU indique l'item de remediation (theme.item), accessible directement depuis le menu principal." -ForegroundColor DarkGray
+    if ($Previous) {
+        $worse = @($Findings | Where-Object { $_.Evolution -eq 'Degrade' }).Count
+        $better = @($Findings | Where-Object { $_.Evolution -eq 'Ameliore' }).Count
+        $delta = $score - [int]$Previous.Score
+        Write-Host ("Depuis le diagnostic du {0:dd/MM/yyyy HH:mm} (indice {1}) : {2}{3} point(s), {4} controle(s) degrade(s), {5} ameliore(s)." -f $Previous.Date, $Previous.Score, $(if ($delta -ge 0) { '+' } else { '' }), $delta, $worse, $better) -ForegroundColor $(if ($worse -gt 0) { 'Yellow' } else { 'Green' })
+    }
+
+    # Plan d'action : les constats a traiter en premier, avec l'action de remediation associee.
+    $todo = @($Findings | Where-Object { $_.Statut -in 'CRITIQUE', 'ALERTE' })
+    if ($todo.Count -gt 0) {
+        Write-Host ""
+        Write-Host "PLAN D'ACTION PRIORITAIRE (tapez le numero x.y depuis le menu pour ouvrir l'action) :" -ForegroundColor White
+        foreach ($t in ($todo | Select-Object -First 12)) {
+            Write-Host ("  {0,-6}" -f $t.Menu) -ForegroundColor $colors[$t.Statut] -NoNewline
+            Write-Host (" {0} : {1}" -f $t.Controle, $t.Recommandation)
+        }
+        if ($todo.Count -gt 12) { Write-Host ("  ... et {0} autre(s) : voir le CSV / le rapport HTML." -f ($todo.Count - 12)) -ForegroundColor DarkGray }
+    }
 }
 
 function ConvertTo-HtmlSafe { param([string]$Text) return [System.Net.WebUtility]::HtmlEncode($Text) }
 
+function Get-HtmlTrendSvg {
+    # Courbe SVG autonome de l'indice d'hygiene (historique des diagnostics du domaine).
+    param([AllowEmptyCollection()][object[]]$Snapshots)
+    $pts = @($Snapshots | Select-Object -Last 30)
+    if ($pts.Count -lt 2) { return '<p class="mut">Historique insuffisant (au moins 2 diagnostics archives) pour tracer une evolution.</p>' }
+    $w = 640; $h = 140; $pad = 24
+    $step = ($w - 2 * $pad) / ($pts.Count - 1)
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $coords = for ($i = 0; $i -lt $pts.Count; $i++) {
+        $x = $pad + $i * $step
+        $y = $h - $pad - ($h - 2 * $pad) * ([double]$pts[$i].Score / 100)
+        [PSCustomObject]@{ X = $x.ToString('0.0', $inv); Y = $y.ToString('0.0', $inv); S = $pts[$i].Score; D = $pts[$i].Date.ToString('dd/MM/yyyy HH:mm') }
+    }
+    $line = ($coords | ForEach-Object { "{0},{1}" -f $_.X, $_.Y }) -join ' '
+    $dots = ($coords | ForEach-Object { "<circle cx='{0}' cy='{1}' r='3.5'><title>{2} : {3}/100</title></circle>" -f $_.X, $_.Y, $_.D, $_.S }) -join ''
+    $grid = (0, 50, 80, 100 | ForEach-Object { $gy = ($h - $pad - ($h - 2 * $pad) * ($_ / 100)).ToString('0.0', $inv); "<line x1='$pad' x2='$($w - $pad)' y1='$gy' y2='$gy' class='grid'/><text x='2' y='$gy' class='axis'>$_</text>" }) -join ''
+    return "<svg viewBox='0 0 $w $h' class='trend' role='img' aria-label='Evolution de l&#39;indice'>$grid<polyline points='$line' class='curve'/>$dots</svg>" +
+           ("<p class='mut'>Du {0} au {1} : {2} diagnostic(s) archive(s).</p>" -f $coords[0].D, $coords[-1].D, $pts.Count)
+}
+
 function New-HtmlReport {
     <#
-        Rapport HTML autonome (aucune dependance externe) : resultat du diagnostic rapide,
+        Rapport HTML autonome (aucune dependance externe, fonctionne hors ligne) : indice et
+        evolution, plan d'action, constats filtrables (statut + recherche), courbe historique,
         statistiques et historique de la session, liste des rapports CSV produits.
     #>
     param([switch]$Open)
@@ -6206,49 +6763,92 @@ function New-HtmlReport {
     }
     $dom = Get-CachedADDomain
     $f = @($Script:LastDiagnostic.Findings)
-    $count = { param($s) @($f | Where-Object Statut -eq $s).Count }
+    $count = { param($st) @($f | Where-Object { $_.Statut -eq $st }).Count }
+    $score = Get-DiagnosticScore -Findings $f
+    $scoreClass = if ($score -ge 80) { 'ok' } elseif ($score -ge 50) { 'warn' } else { 'crit' }
+    $prev = $Script:PreviousDiagnostic
+    $deltaHtml = if ($prev) {
+        $d = $score - [int]$prev.Score
+        "<span class='delta {0}'>{1}{2} depuis le {3:dd/MM/yyyy}</span>" -f $(if ($d -ge 0) { 'up' } else { 'down' }), $(if ($d -ge 0) { '+' } else { '' }), $d, $prev.Date
+    } else { "<span class='delta'>premier diagnostic archive</span>" }
+
+    $evoLabel = @{ 'Degrade' = 'Degrade'; 'Ameliore' = 'Ameliore'; 'Nouveau controle' = 'Nouveau'; 'Non verifie' = 'Non verifie'; 'Inchange' = 'Inchange' }
     $rowsHtml = foreach ($x in $f) {
-        "<tr class='s-$($x.Statut.ToLower())'><td><span class='badge'>$($x.Statut)</span></td><td>$(ConvertTo-HtmlSafe $x.Categorie)</td><td>$(ConvertTo-HtmlSafe $x.Controle)</td><td>$(ConvertTo-HtmlSafe $x.Valeur)</td><td>$(ConvertTo-HtmlSafe $x.Recommandation)</td><td class='menu'>$($x.Menu)</td></tr>"
+        $evo = if ($x.PSObject.Properties['Evolution'] -and $x.Evolution) { "<span class='evo e-$(($x.Evolution -replace '\s', '').ToLower())' title='Statut precedent : $(ConvertTo-HtmlSafe ([string]$x.Precedent))'>$($evoLabel[$x.Evolution])</span>" } else { '' }
+        "<tr class='s-$($x.Statut.ToLower())' data-s='$($x.Statut)'><td><span class='badge'>$($x.Statut)</span></td><td>$evo</td><td>$(ConvertTo-HtmlSafe $x.Categorie)</td><td>$(ConvertTo-HtmlSafe $x.Controle)</td><td>$(ConvertTo-HtmlSafe $x.Valeur)</td><td>$(ConvertTo-HtmlSafe $x.Recommandation)</td><td class='menu'>$($x.Menu)</td></tr>"
     }
+    $planHtml = foreach ($x in @($f | Where-Object { $_.Statut -in 'CRITIQUE', 'ALERTE' })) {
+        "<li class='s-$($x.Statut.ToLower())'><span class='badge'>$($x.Statut)</span> <b>$(ConvertTo-HtmlSafe $x.Controle)</b> ($(ConvertTo-HtmlSafe $x.Valeur)) : $(ConvertTo-HtmlSafe $x.Recommandation) <span class='menu'>[action $($x.Menu)]</span></li>"
+    }
+    $trendHtml = Get-HtmlTrendSvg -Snapshots @(Get-DiagnosticSnapshots -Domain $dom.DNSRoot)
     $histHtml = foreach ($h in $Script:SessionHistory) { "<li>$(ConvertTo-HtmlSafe ('{0:HH:mm:ss} - {1}' -f $h.Date, $h.Label))</li>" }
     $repHtml = foreach ($r in $Script:SessionReports) { "<li>$(ConvertTo-HtmlSafe $r)</li>" }
-    $s = $Script:SessionStats
+    $st = $Script:SessionStats
+
+    $css = @'
+:root{--bg:#f6f7f9;--card:#fff;--txt:#1d2330;--mut:#5b6475;--crit:#c62828;--warn:#d97706;--info:#1565c0;--ok:#2e7d32;--err:#8e24aa;--line:#e3e6ec;--hdr:#0d47a1}
+@media (prefers-color-scheme: dark){:root{--bg:#14171c;--card:#1d2128;--txt:#e6e9ef;--mut:#9aa3b2;--line:#2c323c;--hdr:#0b3a82}}
+*{box-sizing:border-box}body{margin:0;font:14px/1.45 "Segoe UI",Arial,sans-serif;background:var(--bg);color:var(--txt)}
+header{padding:22px 32px;background:var(--hdr);color:#fff;display:flex;flex-wrap:wrap;gap:24px;align-items:center;justify-content:space-between}
+header h1{margin:0 0 4px;font-size:22px}header p{margin:0;opacity:.85}
+.score{text-align:center;background:rgba(255,255,255,.12);border-radius:12px;padding:10px 22px}.score b{display:block;font-size:40px;line-height:1.1}
+.score.crit b{color:#ffb4b4}.score.warn b{color:#ffe08a}.score.ok b{color:#b9f6ca}
+.delta{display:block;font-size:12px;opacity:.9}.delta.up::before{content:"\25B2 "}.delta.down::before{content:"\25BC "}
+main{padding:24px 32px;max-width:1400px;margin:auto}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:20px}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;cursor:pointer;text-align:left;color:var(--txt);font:inherit}
+.kpi b{display:block;font-size:26px}.kpi.active{outline:2px solid var(--info)}
+.kpi.crit b{color:var(--crit)}.kpi.warn b{color:var(--warn)}.kpi.info b{color:var(--info)}.kpi.ok b{color:var(--ok)}.kpi.err b{color:var(--err)}
+section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin-bottom:20px;overflow-x:auto}
+h2{font-size:17px;margin:0 0 12px}h3{font-size:14px;margin:14px 0 6px}
+table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:7px 9px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--mut);font-weight:600;font-size:12px;text-transform:uppercase}
+.badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:700;color:#fff;white-space:nowrap}
+.s-critique .badge{background:var(--crit)}.s-alerte .badge{background:var(--warn)}.s-info .badge{background:var(--info)}.s-ok .badge{background:var(--ok)}.s-erreur .badge{background:var(--err)}
+.evo{font-size:11px;font-weight:600;white-space:nowrap}.e-degrade{color:var(--crit)}.e-ameliore{color:var(--ok)}.e-nouveaucontrole{color:var(--info)}.e-nonverifie{color:var(--err)}.e-inchange{color:var(--mut)}
+.menu{font-family:Consolas,monospace;color:var(--mut);white-space:nowrap}ul{margin:0;padding-left:20px}li{margin:3px 0}
+.plan{list-style:none;padding:0}.plan li{padding:6px 0;border-bottom:1px solid var(--line)}
+.tools{display:flex;gap:10px;margin-bottom:10px;flex-wrap:wrap}.tools input{flex:1;min-width:200px;padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--txt)}
+.mut{color:var(--mut);font-size:12px}.trend{width:100%;max-width:720px;height:auto}.trend .curve{fill:none;stroke:var(--info);stroke-width:2.5}
+.trend circle{fill:var(--info)}.trend .grid{stroke:var(--line)}.trend .axis{fill:var(--mut);font-size:9px}
+footer{color:var(--mut);font-size:12px;padding:0 32px 24px}
+@media (max-width:640px){header,main{padding:16px}footer{padding:0 16px 16px}.kpis{grid-template-columns:repeat(2,1fr)}}
+@media print{.tools,.kpi{cursor:default}tr{display:table-row!important}header{background:#fff;color:#000}}
+'@
+    $js = @'
+(function(){var cur='';var q=document.getElementById('q');var rows=[].slice.call(document.querySelectorAll('#t tbody tr'));
+function apply(){var t=(q.value||'').toLowerCase();var n=0;rows.forEach(function(r){var ok=(!cur||r.getAttribute('data-s')===cur)&&(!t||r.textContent.toLowerCase().indexOf(t)>=0);r.style.display=ok?'':'none';if(ok)n++;});document.getElementById('n').textContent=n+' constat(s) affiche(s)';}
+[].slice.call(document.querySelectorAll('.kpi')).forEach(function(b){b.addEventListener('click',function(){var s=b.getAttribute('data-f');cur=(cur===s)?'':s;[].slice.call(document.querySelectorAll('.kpi')).forEach(function(x){x.classList.toggle('active',x.getAttribute('data-f')===cur&&cur!=='');});apply();});});
+q.addEventListener('input',apply);apply();})();
+'@
     $html = @"
 <!DOCTYPE html>
 <html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Diagnostic AD - $(ConvertTo-HtmlSafe $dom.DNSRoot)</title>
-<style>
-:root{--bg:#f6f7f9;--card:#fff;--txt:#1d2330;--mut:#5b6475;--crit:#c62828;--warn:#e08a00;--info:#1565c0;--ok:#2e7d32;--err:#8e24aa;--line:#e3e6ec}
-@media (prefers-color-scheme: dark){:root{--bg:#14171c;--card:#1d2128;--txt:#e6e9ef;--mut:#9aa3b2;--line:#2c323c}}
-body{margin:0;font:14px/1.45 Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--txt)}
-header{padding:24px 32px;background:#0d47a1;color:#fff}header h1{margin:0 0 4px;font-size:22px}header p{margin:0;opacity:.85}
-main{padding:24px 32px;max-width:1400px;margin:auto}
-.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px}
-.kpi{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}.kpi b{display:block;font-size:26px}
-.kpi.crit b{color:var(--crit)}.kpi.warn b{color:var(--warn)}.kpi.info b{color:var(--info)}.kpi.ok b{color:var(--ok)}.kpi.err b{color:var(--err)}
-section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:20px;overflow-x:auto}
-table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:7px 9px;border-bottom:1px solid var(--line);vertical-align:top}
-th{color:var(--mut);font-weight:600;font-size:12px;text-transform:uppercase}
-.badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:700;color:#fff}
-.s-critique .badge{background:var(--crit)}.s-alerte .badge{background:var(--warn)}.s-info .badge{background:var(--info)}.s-ok .badge{background:var(--ok)}.s-erreur .badge{background:var(--err)}
-.menu{font-family:Consolas,monospace;color:var(--mut)}ul{margin:0;padding-left:20px}footer{color:var(--mut);font-size:12px;padding:0 32px 24px}
-</style></head><body>
-<header><h1>Diagnostic de securite Active Directory</h1>
-<p>Domaine $(ConvertTo-HtmlSafe $dom.DNSRoot) - niveau $(ConvertTo-HtmlSafe ([string]$dom.DomainMode)) - genere le $(Get-Date -Format 'dd/MM/yyyy HH:mm') par $(ConvertTo-HtmlSafe (Get-CurrentUserName))</p></header>
+<style>$css</style></head><body>
+<header><div><h1>Diagnostic de securite Active Directory</h1>
+<p>Domaine $(ConvertTo-HtmlSafe $dom.DNSRoot) - niveau $(ConvertTo-HtmlSafe ([string]$dom.DomainMode)) - genere le $(Get-Date -Format 'dd/MM/yyyy HH:mm') par $(ConvertTo-HtmlSafe (Get-CurrentUserName))</p></div>
+<div class="score $scoreClass"><b>$score</b>/100 indice indicatif$deltaHtml</div></header>
 <main>
 <div class="kpis">
-<div class="kpi crit"><b>$(& $count 'CRITIQUE')</b>Critiques</div><div class="kpi warn"><b>$(& $count 'ALERTE')</b>Alertes</div>
-<div class="kpi info"><b>$(& $count 'INFO')</b>Informations</div><div class="kpi ok"><b>$(& $count 'OK')</b>Conformes</div>
-<div class="kpi err"><b>$(& $count 'ERREUR')</b>Non verifies</div>
+<button class="kpi crit" data-f="CRITIQUE"><b>$(& $count 'CRITIQUE')</b>Critiques</button><button class="kpi warn" data-f="ALERTE"><b>$(& $count 'ALERTE')</b>Alertes</button>
+<button class="kpi err" data-f="ERREUR"><b>$(& $count 'ERREUR')</b>Non verifies</button><button class="kpi info" data-f="INFO"><b>$(& $count 'INFO')</b>Informations</button>
+<button class="kpi ok" data-f="OK"><b>$(& $count 'OK')</b>Conformes</button>
 </div>
+<section><h2>Plan d'action prioritaire</h2>
+<ul class="plan">$(if ($planHtml) { $planHtml -join '' } else { '<li>Aucun constat critique ou alerte.</li>' })</ul>
+<p class="mut">Le numero d'action (x.y) se saisit directement dans le menu principal du script. Toute remediation se teste d'abord en mode simulation.</p></section>
 <section><h2>Constats (diagnostic du $($Script:LastDiagnostic.Date.ToString('dd/MM/yyyy HH:mm')))</h2>
-<table><thead><tr><th>Statut</th><th>Categorie</th><th>Controle</th><th>Valeur</th><th>Recommandation</th><th>Menu</th></tr></thead><tbody>
+<div class="tools"><input id="q" type="search" placeholder="Filtrer (mot-cle, categorie, numero d'action...)"><span id="n" class="mut"></span></div>
+<table id="t"><thead><tr><th>Statut</th><th>Evolution</th><th>Categorie</th><th>Controle</th><th>Valeur</th><th>Recommandation</th><th>Action</th></tr></thead><tbody>
 $($rowsHtml -join "`n")
-</tbody></table></section>
-<section><h2>Session</h2><p>Mode : $(if ($Script:SimulationMode) { 'SIMULATION' } else { 'REEL' }) - actions : $($s.Actions) (reussies $($s.Succes), echecs $($s.Echecs), simulees $($s.Simulees))</p>
+</tbody></table><p class="mut">Cliquez sur un indicateur ci-dessus pour filtrer par statut. ERREUR = controle non realise (droits, connectivite) : jamais compte comme conforme.</p></section>
+<section><h2>Evolution de l'indice</h2>$trendHtml</section>
+<section><h2>Session</h2><p>Mode : $(if ($Script:SimulationMode) { 'SIMULATION' } else { 'REEL' }) - actions d'ecriture : $($st.Actions) (reussies $($st.Succes), echecs $($st.Echecs), simulees $($st.Simulees))</p>
 <h3>Actions lancees</h3><ul>$(if ($histHtml) { $histHtml -join '' } else { '<li>Aucune</li>' })</ul>
 <h3>Rapports CSV produits</h3><ul>$(if ($repHtml) { $repHtml -join '' } else { '<li>Aucun</li>' })</ul></section>
-</main><footer>Rapport genere par AD_Remediation_Menu.ps1 v$($Script:Version). Controles indicatifs, complementaires d'un audit PingCastle complet. La colonne Menu renvoie a l'item de remediation (theme.item) du script.</footer>
+</main><footer>Rapport genere par AD_Remediation_Menu.ps1 v$($Script:Version). Controles indicatifs, complementaires d'un audit PingCastle complet ; l'indice n'est pas le score PingCastle.</footer>
+<script>$js</script>
 </body></html>
 "@
     if (-not (Test-Path -LiteralPath $Script:ReportDir)) { New-Item -Path $Script:ReportDir -ItemType Directory -Force | Out-Null }
@@ -6372,6 +6972,9 @@ $Script:Themes = @(
         (New-MenuItem AUDIT   "Comptes 'adminCount=1' orphelins (anciens administrateurs)" 'Invoke-Audit3AdminCountOrphans')
         (New-MenuItem AUDIT   "Groupes sensibles : pre-Windows 2000, DnsAdmins, operateurs, GPCO" 'Invoke-Audit3SensitiveGroupsMembership')
         (New-MenuItem VALIDER "Nettoyer les comptes 'adminCount=1' orphelins (heritage ACL)" 'Invoke-Remediate3CleanAdminCountOrphans')
+        (New-MenuItem AUDIT   "Droits DCSync et controle de la racine du domaine (ACL)" 'Invoke-Audit3DomainRootControl')
+        (New-MenuItem AUDIT   "Comptes a privileges inactifs ou desactives" 'Invoke-Audit3PrivilegedAccountsHygiene')
+        (New-MenuItem AUDIT   "Groupe principal non standard (appartenance privilegiee cachee)" 'Invoke-Audit3NonStandardPrimaryGroup')
     ) }
     [PSCustomObject]@{ Id = 2; Category = "Identite et comptes"; Name = "Comptes de service"; Items = @(
         (New-MenuItem AUDIT   "Inventaire des comptes de service (SPN / UO choisies)" 'Invoke-Audit4ServiceAccountsInventory')
@@ -6393,6 +6996,7 @@ $Script:Themes = @(
         (New-MenuItem AUDIT   "Mots de passe GPP (cpassword) dans SYSVOL" 'Invoke-Audit11GppPasswords')
         (New-MenuItem AUDIT   "Hygiene des mots de passe (chiffrement reversible, non requis, DES...)" 'Invoke-Audit11PasswordHygiene')
         (New-MenuItem VALIDER "Retirer le chiffrement reversible des mots de passe" 'Invoke-Remediate11DisableReversibleEncryption')
+        (New-MenuItem AUDIT   "Mots de passe stockes dans la description/les notes (heuristique)" 'Invoke-Audit11PasswordInDescription')
     ) }
     [PSCustomObject]@{ Id = 4; Category = "Authentification et protocoles"; Name = "Kerberos et delegations"; Items = @(
         (New-MenuItem AUDIT   "Rapport des delegations Kerberos (non contrainte/contrainte/RBCD)" 'Invoke-RiskyReportDelegations')
@@ -6445,6 +7049,7 @@ $Script:Themes = @(
         (New-MenuItem VALIDER "Activer le pare-feu Windows (3 profils) sur les DC" 'Invoke-Remediate9EnableFirewallBaseline')
         (New-MenuItem AUDIT   "Matrice de durcissement des DC (Spooler, SMB, LDAP, NTLM, pare-feu...)" 'Invoke-Audit9DCHardeningMatrix')
         (New-MenuItem AUDIT   "Sante de la replication, niveaux fonctionnels et roles FSMO" 'Invoke-Audit9ReplicationAndFsmo')
+        (New-MenuItem AUDIT   "Proprietaires des objets ordinateur des DC" 'Invoke-Audit9DCOwnership')
     ) }
     [PSCustomObject]@{ Id = 9; Category = "Infrastructure"; Name = "Windows LAPS"; Items = @(
         (New-MenuItem AUDIT   "Etat du deploiement LAPS (schema, couverture, mots de passe perimes)" 'Invoke-Audit10LapsDeployment')
@@ -6503,6 +7108,7 @@ $Script:Themes = @(
         (New-MenuItem OUTIL   "Registre des exceptions (consulter / ajouter)" 'Invoke-Remediate20InitExceptionsRegister')
         (New-MenuItem AUDIT   "Diagnostic rapide note (tableau de bord, LDAP uniquement)" 'Invoke-QuickDiagnostic')
         (New-MenuItem OUTIL   "Generer le rapport HTML de synthese (diagnostic + session)" 'Invoke-HtmlReportMenu')
+        (New-MenuItem AUDIT   "Historique des diagnostics (evolution de l'indice et des constats)" 'Invoke-DiagnosticHistory')
     ) }
     [PSCustomObject]@{ Id = 17; Category = "Resilience et pilotage"; Name = "Rapports transverses"; Items = @(
         (New-MenuItem AUDIT   "Export des comptes inactifs (utilisateurs/ordinateurs)" 'Invoke-ReportInactiveAccounts')
@@ -6529,12 +7135,37 @@ function Invoke-HtmlReportMenu { [void](New-HtmlReport -Open) }
 
 function Get-ThemeById { param([int]$Id) return ($Script:Themes | Where-Object { $_.Id -eq $Id } | Select-Object -First 1) }
 
+function Find-MenuItemByFunction {
+    # Retrouve l'entree de menu d'une fonction (raccourcis D/H independants de la numerotation).
+    param([Parameter(Mandatory)][string]$Fn)
+    foreach ($t in $Script:Themes) {
+        for ($i = 0; $i -lt $t.Items.Count; $i++) {
+            if ($t.Items[$i].Fn -eq $Fn) { return [PSCustomObject]@{ Theme = $t; Index = $i + 1 } }
+        }
+    }
+    return $null
+}
+
+function Get-DiagnosticFlags {
+    # "x.y" -> statut le plus grave (CRITIQUE > ALERTE) du dernier diagnostic, pour baliser les menus.
+    $flags = @{}
+    if (-not $Script:LastDiagnostic) { return $flags }
+    foreach ($f in $Script:LastDiagnostic.Findings) {
+        if ($f.Statut -notin 'CRITIQUE', 'ALERTE' -or -not $f.Menu) { continue }
+        if ($flags[$f.Menu] -ne 'CRITIQUE') { $flags[$f.Menu] = $f.Statut }
+    }
+    return $flags
+}
+
 function Write-ThemeItemLine {
-    param([Parameter(Mandatory)][string]$Number, [Parameter(Mandatory)]$Item)
+    param([Parameter(Mandatory)][string]$Number, [Parameter(Mandatory)]$Item, [string]$Code, [hashtable]$Flags)
     $style = $Script:TagStyle[$Item.Tag]
-    Write-Host (" {0,5}. " -f $Number) -NoNewline
+    $flag = if ($Flags -and $Code) { $Flags[$Code] } else { $null }
+    Write-Host $(if ($flag) { '  !' } else { '   ' }) -ForegroundColor $(if ($flag -eq 'CRITIQUE') { 'Red' } else { 'Yellow' }) -NoNewline
+    Write-Host ("{0,3}. " -f $Number) -NoNewline
     Write-Host $style.Text -ForegroundColor $style.Color -NoNewline
-    Write-Host (" {0}" -f $Item.Label)
+    Write-Host (" {0}" -f $Item.Label) -NoNewline
+    if ($Code) { Write-Host ("  [{0}]" -f $Code) -ForegroundColor DarkGray } else { Write-Host "" }
 }
 
 function Invoke-ThemeItem {
@@ -6543,19 +7174,24 @@ function Invoke-ThemeItem {
         remet a zero le compteur d'echecs (messages de resultat fiables), et intercepte toute
         erreur inattendue pour qu'elle ne fasse jamais sortir du script.
     #>
-    param([Parameter(Mandatory)]$Theme, [Parameter(Mandatory)][int]$Index)
+    param([Parameter(Mandatory)]$Theme, [Parameter(Mandatory)][int]$Index, [switch]$NoPause)
     $item = $Theme.Items[$Index - 1]
     $label = "{0}.{1} {2}" -f $Theme.Id, $Index, $item.Label
     $Script:CurrentActionFailures = 0
+    $Script:LastActionRef = [PSCustomObject]@{ Theme = $Theme; Index = $Index }
     $Script:SessionHistory.Add([PSCustomObject]@{ Date = Get-Date; Label = $label; Tag = $item.Tag })
     Write-Log ("=== Action {0} [{1}] ===" -f $label, $item.Tag) -Level INFO
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         & $item.Fn
     } catch {
         Write-Log ("Erreur inattendue pendant l'action '{0}' : {1}" -f $label, $_.Exception.Message) -Level ERROR
         Write-Log ("Emplacement : {0}" -f ($_.InvocationInfo.PositionMessage -replace "`r?`n", ' ')) -Level ERROR
     }
-    Pause-Menu
+    $sw.Stop()
+    Write-Host ""
+    Write-Host ("--- Fin de l'action {0}.{1} ({2:N1} s){3} ---" -f $Theme.Id, $Index, $sw.Elapsed.TotalSeconds, $(if ($Script:CurrentActionFailures -gt 0) { ", $($Script:CurrentActionFailures) echec(s)" } else { '' })) -ForegroundColor $(if ($Script:CurrentActionFailures -gt 0) { 'Yellow' } else { 'DarkGray' })
+    if (-not $NoPause) { Pause-Menu }
 }
 
 function Resolve-DirectAccess {
@@ -6568,23 +7204,78 @@ function Resolve-DirectAccess {
     return [PSCustomObject]@{ Theme = $t; Index = $i }
 }
 
+function Invoke-CommonShortcut {
+    <#
+        Raccourcis disponibles dans TOUS les menus : acces direct x.y, D, H, R, P, ?.
+        Retourne $true si la saisie a ete traitee.
+    #>
+    param([string]$Choice)
+    $direct = Resolve-DirectAccess -Text $Choice
+    if ($direct) { Invoke-ThemeItem -Theme $direct.Theme -Index $direct.Index; return $true }
+    switch ($Choice.ToUpper()) {
+        'D' { $m = Find-MenuItemByFunction 'Invoke-QuickDiagnostic'; Invoke-ThemeItem -Theme $m.Theme -Index $m.Index; return $true }
+        'H' { $m = Find-MenuItemByFunction 'Invoke-HtmlReportMenu'; Invoke-ThemeItem -Theme $m.Theme -Index $m.Index; return $true }
+        'R' { Invoke-SearchActions; return $true }
+        '?' { Show-Help; return $true }
+        'P' {
+            if ($Script:LastActionRef) { Invoke-ThemeItem -Theme $Script:LastActionRef.Theme -Index $Script:LastActionRef.Index }
+            else { Write-Host "Aucune action lancee dans cette session." -ForegroundColor Yellow; Start-Sleep -Milliseconds 900 }
+            return $true
+        }
+    }
+    return $false
+}
+
+function Show-Help {
+    Show-Banner
+    Write-Host " AIDE" -ForegroundColor White
+    Write-Host ""
+    Write-Host " Navigation" -ForegroundColor Cyan
+    Write-Info "  1..18     ouvrir un theme             x.y (ex : 4.2)  lancer directement l'action y du theme x" `
+               "  D         diagnostic rapide note       H               rapport HTML de synthese" `
+               "  R         rechercher une action        P               relancer la derniere action" `
+               "  S         basculer simulation / reel   Q / 0           quitter / revenir"
+    Write-Host ""
+    Write-Host " Lecture des menus" -ForegroundColor Cyan
+    Write-Host "  [AUDIT]     " -ForegroundColor Cyan -NoNewline; Write-Host "lecture seule, aucune modification"
+    Write-Host "  [SAFE]      " -ForegroundColor Green -NoNewline; Write-Host "modification sans impact sur la production (confirmation O/N)"
+    Write-Host "  [A VALIDER] " -ForegroundColor Red -NoNewline; Write-Host "impact possible : saisie de CONFIRMER en mode reel"
+    Write-Host "  [OUTIL]     " -ForegroundColor Gray -NoNewline; Write-Host "documentation, procedures, outillage"
+    Write-Host "  !           " -ForegroundColor Red -NoNewline; Write-Host "action liee a un constat CRITIQUE (rouge) ou ALERTE (jaune) du dernier diagnostic"
+    Write-Host ""
+    Write-Host " Selections dans les listes" -ForegroundColor Cyan
+    Write-Info "  0,3,7  |  2-6  |  tous  |  vide = annuler. Les selecteurs d'UO acceptent un filtre et un DN complet."
+    Write-Host ""
+    Write-Host " Securite" -ForegroundColor Cyan
+    Write-Info "  Le mode SIMULATION (defaut) journalise ce qui SERAIT fait sans rien modifier." `
+               "  Les comptes systeme, DC, comptes d'approbation, gMSA et membres des groupes a privileges" `
+               "  ne sont jamais desactives. Aucune suppression de compte n'est jamais effectuee."
+    Write-Host ""
+    Write-Host " Fichiers" -ForegroundColor Cyan
+    Write-Info ("  Journal  : {0}" -f $Script:LogFile) `
+               ("  Rapports : {0}" -f $Script:ReportDir) `
+               ("  Historique des diagnostics : {0}" -f $Script:DiagHistoryDir)
+    Pause-Menu
+}
+
 function Show-ThemeMenu {
     param([Parameter(Mandatory)]$Theme)
     do {
         Show-Banner
+        $flags = Get-DiagnosticFlags
         Write-Host ("=== {0}. {1} ===" -f $Theme.Id, $Theme.Name.ToUpper()) -ForegroundColor Cyan
         foreach ($tag in 'AUDIT', 'SAFE', 'VALIDER', 'OUTIL') {
             $idx = @(for ($i = 0; $i -lt $Theme.Items.Count; $i++) { if ($Theme.Items[$i].Tag -eq $tag) { $i } })
             if ($idx.Count -eq 0) { continue }
             Write-Host ("  -- {0} --" -f $Script:TagStyle[$tag].Section) -ForegroundColor DarkYellow
-            foreach ($i in $idx) { Write-ThemeItemLine -Number ([string]($i + 1)) -Item $Theme.Items[$i] }
+            foreach ($i in $idx) { Write-ThemeItemLine -Number ([string]($i + 1)) -Item $Theme.Items[$i] -Code ("{0}.{1}" -f $Theme.Id, ($i + 1)) -Flags $flags }
         }
         Write-Host ""
-        Write-Host "     0. Retour au menu principal     (acces direct a un autre theme : ex. 4.2)" -ForegroundColor DarkGray
-        $choice = (Read-Host "Votre choix").Trim()
-        if ($choice -in @('0', 'q', 'Q', '')) { if ($choice -ne '') { return } else { continue } }
-        $direct = Resolve-DirectAccess -Text $choice
-        if ($direct) { Invoke-ThemeItem -Theme $direct.Theme -Index $direct.Index; continue }
+        Write-Host "     0. Retour    [x.y] autre theme    [P] relancer    [D] diagnostic    [?] aide" -ForegroundColor DarkGray
+        $choice = ([string](Read-Host "Votre choix")).Trim()
+        if ($choice -eq '') { continue }
+        if ($choice -in @('0', 'q', 'Q')) { return }
+        if (Invoke-CommonShortcut -Choice $choice) { continue }
         $n = 0
         if ([int]::TryParse($choice, [ref]$n) -and $n -ge 1 -and $n -le $Theme.Items.Count) {
             Invoke-ThemeItem -Theme $Theme -Index $n
@@ -6655,6 +7346,7 @@ function Show-SessionSummary {
 function Show-MainMenu {
     do {
         Show-Banner
+        $flags = Get-DiagnosticFlags
         Write-Host " MENU PRINCIPAL" -ForegroundColor White
         $lastCat = $null
         foreach ($t in $Script:Themes) {
@@ -6665,26 +7357,29 @@ function Show-MainMenu {
             }
             $nA = @($t.Items | Where-Object Tag -eq 'AUDIT').Count
             $nR = @($t.Items | Where-Object { $_.Tag -in 'SAFE', 'VALIDER' }).Count
+            $codes = @($flags.Keys | Where-Object { $_ -like "$($t.Id).*" })
+            $nc = @($codes | Where-Object { $flags[$_] -eq 'CRITIQUE' }).Count
+            $nw = $codes.Count - $nc
             Write-Host (" {0,3}. " -f $t.Id) -NoNewline
             Write-Host ("{0,-48}" -f $t.Name) -ForegroundColor Cyan -NoNewline
-            Write-Host ("{0,2} audit(s), {1,2} remediation(s)" -f $nA, $nR) -ForegroundColor DarkGray
+            Write-Host ("{0,2} audit(s), {1,2} remediation(s)" -f $nA, $nR) -ForegroundColor DarkGray -NoNewline
+            if ($nc -gt 0) { Write-Host ("  ! {0} critique(s)" -f $nc) -ForegroundColor Red -NoNewline }
+            if ($nw -gt 0) { Write-Host ("  ! {0} alerte(s)" -f $nw) -ForegroundColor Yellow -NoNewline }
+            Write-Host ""
         }
         Write-Host ""
         Write-Host "  [D] Diagnostic rapide note (lecture seule)   [H] Rapport HTML de synthese" -ForegroundColor Magenta
         Write-Host "  [R] Rechercher une action par mot-cle        [x.y] Acces direct (ex : 4.2)" -ForegroundColor DarkCyan
+        Write-Host "  [P] Relancer la derniere action              [?] Aide (raccourcis, legende)" -ForegroundColor DarkCyan
         $modeLabel = if ($Script:SimulationMode) { "Activer le mode REEL (desactiver la simulation)" } else { "Repasser en mode SIMULATION" }
         Write-Host ("  [S] {0}" -f $modeLabel) -ForegroundColor Yellow
         Write-Host "  [Q] Quitter"
         Write-Host ""
-        $choice = (Read-Host "Votre choix").Trim()
-
-        $direct = Resolve-DirectAccess -Text $choice
-        if ($direct) { Invoke-ThemeItem -Theme $direct.Theme -Index $direct.Index; continue }
+        $choice = ([string](Read-Host "Votre choix")).Trim()
+        if ($choice -eq '') { continue }
+        if (Invoke-CommonShortcut -Choice $choice) { continue }
         switch ($choice.ToUpper()) {
-            'D' { Invoke-ThemeItem -Theme (Get-ThemeById 16) -Index 3; continue }
-            'H' { Invoke-ThemeItem -Theme (Get-ThemeById 16) -Index 4; continue }
-            'R' { Invoke-SearchActions; continue }
-            'S' { Switch-SimulationMode; continue }
+            'S' { Switch-SimulationMode }
             'Q' {
                 Show-SessionSummary
                 if (($Script:SessionReports.Count -gt 0 -or $Script:SessionStats.Actions -gt 0) -and (Read-YesNo -Prompt "Generer le rapport HTML de synthese avant de quitter ?")) {
@@ -6692,11 +7387,12 @@ function Show-MainMenu {
                 }
                 return
             }
-        }
-        $n = 0
-        if ([int]::TryParse($choice, [ref]$n)) {
-            $t = Get-ThemeById -Id $n
-            if ($t) { Show-ThemeMenu -Theme $t }
+            default {
+                $n = 0
+                $t = if ([int]::TryParse($choice, [ref]$n)) { Get-ThemeById -Id $n } else { $null }
+                if ($t) { Show-ThemeMenu -Theme $t }
+                else { Write-Host "Choix invalide ('?' pour l'aide)." -ForegroundColor Yellow; Start-Sleep -Milliseconds 700 }
+            }
         }
     } while ($true)
 }
@@ -6704,6 +7400,9 @@ function Show-MainMenu {
 # ============================================================
 #  POINT D'ENTREE
 # ============================================================
+
+# Script charge par dot-sourcing (tests automatises) : definitions uniquement, aucun menu.
+if ($MyInvocation.InvocationName -eq '.') { return }
 
 Show-Banner
 Write-Log ("Demarrage du script de remediation AD v{0} (PowerShell {1}, {2})." -f $Script:Version, $PSVersionTable.PSVersion, $env:COMPUTERNAME) -Level INFO
@@ -6723,7 +7422,18 @@ if ($QuickAudit) {
     exit $(if ($crit -gt 0) { 2 } else { 0 })
 }
 
-Write-Log "Mode simulation actif par defaut. Utilisez [S] dans le menu principal pour appliquer reellement les actions." -Level WARN
+if ($Action) {
+    # Lancement direct d'une action (ex : -Action 4.2), puis sortie. Code retour 1 si un echec.
+    $direct = Resolve-DirectAccess -Text $Action
+    if (-not $direct) { Write-Log ("Action '{0}' inexistante (format theme.item, voir le catalogue)." -f $Action) -Level ERROR; exit 1 }
+    if (-not $Simulation) { Switch-SimulationMode }
+    if ($Script:SimulationMode) { Write-Log "Execution en mode SIMULATION (aucune modification)." -Level WARN }
+    Invoke-ThemeItem -Theme $direct.Theme -Index $direct.Index -NoPause
+    Show-SessionSummary
+    exit $(if ($Script:SessionStats.Echecs -gt 0) { 1 } else { 0 })
+}
+
+Write-Log "Mode simulation actif par defaut. Utilisez [S] dans le menu principal pour appliquer reellement les actions ([?] pour l'aide)." -Level WARN
 Pause-Menu
 Show-MainMenu
 Write-Log "Fin du script." -Level INFO
