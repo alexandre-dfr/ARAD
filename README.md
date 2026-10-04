@@ -4,6 +4,8 @@ Script PowerShell à menu pour **auditer et remédier** les constats Active Dire
 
 Il est construit pour qu'aucune action ne parte « par accident » : **mode simulation par défaut**, confirmations renforcées sur tout ce qui a un impact, vérifications préalables, et garde-fous non désactivables sur les objets critiques.
 
+> **Version 3.1** — suppression de nouveaux faux positifs (gMSA, AZUREADSSOACC, groupes absents, cycle de vie des OS figé...), 6 nouveaux contrôles (DCSync, propriétaires des DC, groupe principal caché...), **suivi d'évolution** du diagnostic, rapport HTML interactif, interface enrichie et **tests automatisés**. Voir [Nouveautés v3.1](#nouveautés-v31).
+>
 > **Version 3.0** — refonte complète : corrections de véracité (plusieurs remédiations faisaient l'inverse de l'effet annoncé ou ne tenaient pas dans la durée), suppression des faux positifs, AD francisé pris en charge, interface pilotée par une table unique, diagnostic rapide noté, rapport HTML, une vingtaine de nouvelles actions. Voir [Nouveautés et corrections v3](#nouveautés-et-corrections-v3).
 
 ---
@@ -19,6 +21,8 @@ Il est construit pour qu'aucune action ne parte « par accident » : **mode simu
 - [Focus techniques](#focus-techniques)
 - [Journalisation et fichiers produits](#journalisation-et-fichiers-produits)
 - [Dépannage WinRM](#dépannage-winrm)
+- [Tests automatisés](#tests-automatisés)
+- [Nouveautés v3.1](#nouveautés-v31)
 - [Nouveautés et corrections v3](#nouveautés-et-corrections-v3)
 - [Limites connues](#limites-connues)
 
@@ -43,6 +47,9 @@ Il est construit pour qu'aucune action ne parte « par accident » : **mode simu
 # Code retour : 0 = aucun constat critique, 2 = au moins un constat critique, 1 = prérequis KO
 .\AD_Remediation_Menu.ps1 -QuickAudit
 
+# Lancer directement une action (ici 4.2) puis quitter - simulation par défaut
+.\AD_Remediation_Menu.ps1 -Action 4.2
+
 # Options
 .\AD_Remediation_Menu.ps1 -LogDir D:\Audit\AD -NoClear
 ```
@@ -52,6 +59,9 @@ Il est construit pour qu'aucune action ne parte « par accident » : **mode simu
 | `-QuickAudit` | Lance uniquement le diagnostic rapide (lecture seule), génère le rapport HTML et quitte. Utilisable en tâche planifiée pour un suivi régulier. |
 | `-LogDir` | Dossier des journaux et rapports (défaut : `.\Logs`). |
 | `-NoClear` | N'efface pas l'écran entre deux menus (garde tout l'historique de la session dans la console). |
+| `-Action x.y` | Lance directement l'action `x.y` du catalogue puis quitte (code retour 1 si une écriture a échoué). Simulation par défaut ; `-Simulation:$false` demande la confirmation habituelle `CONFIRMER` pour passer en mode réel. |
+
+> **Suivi régulier** : planifiez `-QuickAudit` (tâche hebdomadaire). Chaque diagnostic est archivé dans `Logs\Diagnostics` : le suivant affiche l'**évolution** (contrôles dégradés / améliorés, écart d'indice) et le rapport HTML trace la **courbe** de l'indice.
 
 ## Interface
 
@@ -63,21 +73,26 @@ Il est construit pour qu'aucune action ne parte « par accident » : **mode simu
   Domaine   : corp.local   (PDC : dc1.corp.local)
   Operateur : CORP\adm-jdupont
   Session   : 3 action(s) [0 ok / 0 echec / 3 simulee(s)], 5 rapport(s)
+  Diagnostic: indice 74/100 - 2 critique(s), 2 alerte(s) - 08:58 (actions concernees marquees '!' dans les menus)
 ==============================================================================
   Legende : [AUDIT] lecture seule  [SAFE] sans impact prod  [A VALIDER] impact potentiel  [OUTIL]
 
  MENU PRINCIPAL
 
  -- IDENTITE ET COMPTES --
-   1. Comptes a privileges                             7 audit(s),  7 remediation(s)
+   1. Comptes a privileges                            10 audit(s),  7 remediation(s)  ! 1 critique(s)
    2. Comptes de service                               3 audit(s),  5 remediation(s)
+   3. Mots de passe et authentification                5 audit(s),  4 remediation(s)  ! 1 alerte(s)
    ...
   [D] Diagnostic rapide note (lecture seule)   [H] Rapport HTML de synthese
   [R] Rechercher une action par mot-cle        [x.y] Acces direct (ex : 4.2)
+  [P] Relancer la derniere action              [?] Aide (raccourcis, legende)
   [S] Activer le mode REEL (desactiver la simulation)
   [Q] Quitter
 ```
 
+- **Marqueurs issus du diagnostic** : après un diagnostic, chaque thème affiche son nombre de constats critiques/alertes, et dans les sous-menus les actions de remédiation correspondantes sont précédées d'un **`!`** rouge (critique) ou jaune (alerte). Chaque action affiche aussi son code `[x.y]`.
+- **Raccourcis disponibles partout** (menu principal et sous-menus) : `x.y`, `D`, `H`, `R`, `P` (relancer la dernière action), `?` (aide). Chaque action se termine par un bandeau indiquant sa durée et ses éventuels échecs.
 - **Accès direct** : tapez `4.2` (ou `4-2`) depuis n'importe quel menu pour lancer directement l'action 2 du thème 4. Les numéros `x.y` sont ceux du [catalogue](#catalogue-des-actions) et de la colonne *Menu* du diagnostic.
 - **Recherche** `[R]` : plusieurs mots-clés possibles (tous requis), recherche dans les libellés et les thèmes ; le résultat se **lance directement** en tapant son numéro (avec ses garde-fous habituels).
 - **Sous-menus regroupés par nature** : Audit → Remédiation SAFE → Remédiation A VALIDER → Outils, avec un badge coloré par action.
@@ -107,7 +122,11 @@ krbtgt (âge), corbeille AD, dernière sauvegarde AD (métadonnées `dSASignatur
 
 Un **indice indicatif d'hygiène** (100 − 10 par critique − 3 par alerte) est affiché ; ce n'est **pas** le score PingCastle.
 
-`[H]` (ou `16.4`) génère un **rapport HTML autonome** (aucune dépendance externe, mode sombre automatique) : indicateurs, tableau des constats, historique des actions de la session et liste des rapports CSV produits.
+Contrôles ajoutés en v3.1 : **droits DCSync / contrôle de la racine du domaine** (ACL), **propriétaires des objets DC**, **groupe principal non standard** (appartenance cachée), **comptes à privilèges inactifs ou désactivés**, utilisateurs au mot de passe n'expirant jamais, **mots de passe dans la description/les notes**. Un contrôle qui ne peut pas être réalisé (droits, connectivité, liste des DC illisible...) est toujours `ERREUR`, jamais `OK`.
+
+Après le tableau, un **plan d'action prioritaire** liste les constats critiques puis les alertes avec le numéro d'action à saisir. Si un diagnostic précédent du même domaine existe (`Logs\Diagnostics`), une colonne **ÉVOL.** indique pour chaque contrôle `PIRE` / `MIEUX` / `=` / `NOUV.`, suivie de l'écart d'indice. L'action `16.5` affiche l'historique complet (courbe en mode texte, export CSV).
+
+`[H]` (ou `16.4`) génère un **rapport HTML autonome** (aucune dépendance externe, fonctionne hors ligne, mode sombre automatique, lisible sur mobile, imprimable) : indice et écart avec le diagnostic précédent, indicateurs **cliquables pour filtrer** par statut, **recherche** instantanée, plan d'action, colonne d'évolution, **courbe de l'indice** sur les 30 derniers diagnostics, historique des actions de la session et liste des rapports CSV produits.
 
 ## Catalogue des actions
 
@@ -131,6 +150,9 @@ Légende : **Audit** = lecture seule · **SAFE** = sans impact prod (O/N) · **A
 | 1.12 | Audit | Comptes 'adminCount=1' orphelins (anciens administrateurs) |
 | 1.13 | Audit | Groupes sensibles : pre-Windows 2000, DnsAdmins, operateurs, GPCO |
 | 1.14 | A VALIDER | Nettoyer les comptes 'adminCount=1' orphelins (heritage ACL) |
+| 1.15 | Audit | Droits DCSync et controle de la racine du domaine (ACL) *(v3.1)* |
+| 1.16 | Audit | Comptes a privileges inactifs ou desactives *(v3.1)* |
+| 1.17 | Audit | Groupe principal non standard (appartenance privilegiee cachee) *(v3.1)* |
 
 ### 2. Comptes de service
 
@@ -158,6 +180,7 @@ Légende : **Audit** = lecture seule · **SAFE** = sans impact prod (O/N) · **A
 | 3.7 | Audit | Mots de passe GPP (cpassword) dans SYSVOL |
 | 3.8 | Audit | Hygiene des mots de passe (chiffrement reversible, non requis, DES...) |
 | 3.9 | A VALIDER | Retirer le chiffrement reversible des mots de passe |
+| 3.10 | Audit | Mots de passe stockes dans la description/les notes (heuristique) *(v3.1)* |
 
 ### 4. Kerberos et delegations
 
@@ -225,6 +248,7 @@ Légende : **Audit** = lecture seule · **SAFE** = sans impact prod (O/N) · **A
 | 8.10 | A VALIDER | Activer le pare-feu Windows (3 profils) sur les DC |
 | 8.11 | Audit | Matrice de durcissement des DC (Spooler, SMB, LDAP, NTLM, pare-feu...) |
 | 8.12 | Audit | Sante de la replication, niveaux fonctionnels et roles FSMO |
+| 8.13 | Audit | Proprietaires des objets ordinateur des DC *(v3.1)* |
 
 ### 9. Windows LAPS
 
@@ -307,6 +331,7 @@ Légende : **Audit** = lecture seule · **SAFE** = sans impact prod (O/N) · **A
 | 16.2 | Outil | Registre des exceptions (consulter / ajouter) |
 | 16.3 | Audit | Diagnostic rapide note (tableau de bord, LDAP uniquement) |
 | 16.4 | Outil | Generer le rapport HTML de synthese (diagnostic + session) |
+| 16.5 | Audit | Historique des diagnostics (evolution de l'indice et des constats) *(v3.1)* |
 
 ### 17. Rapports transverses
 
@@ -343,7 +368,7 @@ La politique de mot de passe est portée par la GPO **Default Domain Policy** : 
 Logique commune aux actions manuelles, au rapport et au script planifié :
 - inclut les comptes **jamais connectés** (auparavant ignorés : `lastLogonTimestamp` vide) sauf s'ils ont été créés après la date seuil ;
 - exclut les comptes dont le **mot de passe a changé après la date seuil** (un ordinateur vivant renouvelle son mot de passe tous les 30 jours : supprime les faux positifs de machines simplement peu connectées) ;
-- exclut **comptes d'approbation** (désactiver un compte de trust casse l'approbation), **DC/RODC**, **objets de cluster** (CNO/VCO, dont le `lastLogonTimestamp` reste ancien), comptes système et groupes exclus ;
+- exclut **comptes d'approbation** (désactiver un compte de trust casse l'approbation), **DC/RODC**, **objets de cluster** (CNO/VCO, dont le `lastLogonTimestamp` reste ancien), **comptes de service gérés** (gMSA/MSA/dMSA, renvoyés par `Get-ADComputer`), le compte **`AZUREADSSOACC$`** (Seamless SSO Entra : jamais « connecté » mais indispensable), les comptes `krbtgt*`, comptes système et groupes exclus — y compris dans le script de la tâche planifiée ;
 - refuse un seuil < 30 jours (`lastLogonTimestamp` est répliqué avec jusqu'à 14 jours de retard) ;
 - CSV de revue listant aussi les **exclus avec leur motif**, sélection partielle possible avant confirmation.
 
@@ -378,7 +403,7 @@ Test d'une **vraie négociation TLS** sur 636 (et non d'une simple ouverture de 
 - **Windows LAPS (`9.4`)** : accorde aux ordinateurs le droit d'écrire leur mot de passe (`Set-LapsADComputerSelfPermission`), sans lequel aucun mot de passe n'est sauvegardé ; option de chiffrement (niveau 2016+) ; la couverture `9.1` exclut les DC, compte aussi LAPS legacy et détecte les mots de passe expirés (client LAPS en échec).
 - **RPC (`12.6`)** : avertissement si la GPO cible les DC (paramètres recommandés pour les serveurs membres uniquement).
 - **Sauvegarde (`13.1`)** : date de dernière sauvegarde lue dans l'annuaire (tous outils de sauvegarde), comparée à la durée de vie des tombstones ; le parseur `wbadmin` (dépendant de la langue, qui retenait la *plus ancienne* version) est remplacé par le journal `Microsoft-Windows-Backup`.
-- **Obsolescence (`14.1`)** : statut calculé avec le **numéro de build** (Windows 10 LTSC, versions de Windows 11) et des dates de fin de support à jour (Windows 10 hors LTSC fin de support le 14/10/2025, Server 2016 le 12/01/2027...).
+- **Obsolescence (`14.1`)** : statut **calculé à la date du jour** à partir d'une table de cycle de vie (`$Script:OsLifecycle`) tenant compte du **numéro de build** (Windows 10 LTSC/IoT, versions de Windows 11) et de l'**édition** (calendrier étendu Entreprise/Éducation de Windows 11) : `EOL`, `BIENTOT` (fin dans moins d'un an), `SUPPORTE`. Le statut ne se périme plus avec le temps.
 
 ## Journalisation et fichiers produits
 
@@ -387,6 +412,7 @@ Test d'une **vraie négociation TLS** sur 636 (et non d'une simple ouverture de 
 | `Logs\Remediation_AD_<horodatage>.log` | Journal complet de la session (y compris simulation). |
 | `Logs\Rapports_<horodatage>\*.csv` | Tous les rapports de la session (séparateur `;`, UTF-8 BOM : ouverture directe dans Excel FR). |
 | `Logs\Rapports_<horodatage>\Synthese_AD_*.html` | Rapport HTML de synthèse. |
+| `Logs\Diagnostics\Diagnostic_<domaine>_<horodatage>.json` | Historique des diagnostics (évolution, courbe du rapport HTML, `16.5`). |
 | `Logs\GPO_Backups\` | Sauvegardes de GPO (complètes `10.2`, et automatique de la Default Domain Policy avant `3.4`). |
 | `Logs\Procedures\` | Procédures de récupération (objet / DC / forêt) et recommandations MFA. |
 | `Logs\Registre_Exceptions.csv` | Registre des risques acceptés (`16.2` : consultation, ajout guidé, alerte sur les revues échues). |
@@ -401,6 +427,34 @@ Les actions distantes vérifient au préalable la joignabilité WinRM (`Test-WSM
 - **[2] immédiatement par WMI/DCOM** (`winrm quickconfig` + règle de pare-feu activée par son **nom interne**, indépendant de la langue), avec attente active de la disponibilité (60 s max).
 
 En dépannage manuel : service WinRM démarré (`Enable-PSRemoting -Force`), règle « Gestion à distance de Windows (HTTP-In) » active sur le profil réseau utilisé (le profil *Public* la bloque), résolution DNS du nom du DC, port 5985 ouvert entre le poste et le DC.
+
+## Tests automatisés
+
+```powershell
+.\Tests\Invoke-SelfTest.ps1     # Windows PowerShell 5.1 ou PowerShell 7 (Windows/Linux), sans AD ni Pester
+```
+
+Une quarantaine de tests sans dépendance vérifient : syntaxe et encodage (UTF-8 BOM pour PowerShell 5.1), cohérence des menus (chaque entrée pointe vers une fonction existante, pas de doublon), **validité de chaque renvoi `x.y` du diagnostic**, sélections (`0,3`, `2-6`, `tous`), table de cycle de vie des OS à date fixe, extraction GPP, évaluation sIDHistory, distinction gMSA/DC/cluster/SSO, détection de mots de passe sans fuite du secret, indice et évolution du diagnostic, historique JSON, et rapport HTML (contenu échappé, aucune dépendance externe, JavaScript valide si Node.js est présent). Code retour 0 = succès. Le script peut être chargé par dot-sourcing (`. .\AD_Remediation_Menu.ps1`) sans lancer le menu.
+
+## Nouveautés v3.1
+
+**Faux positifs / véracité**
+- **gMSA, MSA et dMSA** (qui dérivent de la classe `computer`) n'étaient pas distingués des ordinateurs : comptés « non couverts » par LAPS, proposés à la **désactivation comme inactifs** (y compris par la tâche planifiée) et listés dans l'inventaire des OS → exclus partout.
+- **`AZUREADSSOACC$`** (Seamless SSO Entra ID) proposé à la désactivation et compté sans LAPS → exclu (sa désactivation casse l'authentification unique).
+- Couverture LAPS : objets de **cluster** et machines **non-Windows** exclus du calcul (affichés à part).
+- Groupes **inexistants** (Key Admins avant le niveau 2016, DnsAdmins sans DNS intégré) : n'émettent plus d'avertissement « lecture impossible » et ne font plus passer le contrôle du diagnostic en `ERREUR`.
+- Diagnostic : une liste de DC illisible donnait « 0 DC inscriptible » (`ALERTE` erronée) → `ERREUR`.
+- **Mots de passe GPP** : le compte du premier élément du fichier était attribué à tous les mots de passe trouvés → compte de chaque élément ; les `cpassword` vides ne sont plus comptés.
+- **Cycle de vie des OS** figé dans des libellés (ex. « bientôt » restait affiché après la date) → calculé à la date du jour, avec édition Windows 11 et Windows 10 IoT LTSC.
+- **sIDHistory** : le diagnostic et l'audit n'utilisaient pas la même liste de RID privilégiés → règle unique (et RID 526/527 ajoutés).
+- Kerberoasting (diagnostic) : comptes sans date de mot de passe comptés à tort.
+- `krbtgt_AzureAD` (Entra Kerberos) et krbtgt de RODC orphelins étaient étiquetés « RODC : » vide → libellés exacts.
+
+**Nouveaux contrôles** : `1.15` droits DCSync / Contrôle total / WriteDacl / WriteOwner sur la racine du domaine (les comptes de synchronisation Entra `MSOL_*` / `provAgentgMSA` sont identifiés et signalés en alerte plutôt qu'en critique) ; `1.16` comptes à privilèges inactifs ou désactivés ; `1.17` groupe principal non standard ; `3.10` mots de passe dans description/notes (extrait masqué, jamais le secret) ; `8.13` propriétaires des objets DC ; `16.5` historique des diagnostics. Tous sont aussi intégrés au diagnostic rapide.
+
+**Interface** : marqueurs `!` et compteurs par thème issus du dernier diagnostic, ligne « Diagnostic » dans l'en-tête, code `[x.y]` affiché sur chaque action, raccourcis communs à tous les menus (`P` relancer, `?` aide), écran d'aide, bandeau de fin d'action (durée, échecs), plan d'action prioritaire et colonne d'évolution dans le diagnostic, rapport HTML interactif (filtres, recherche, courbe, mobile, impression), paramètre `-Action`.
+
+**Code** : liste des DC mise en cache pour la session (une requête au lieu d'une par action), raccourcis `D`/`H` résolus par nom de fonction (plus d'index codés en dur), gestion des raccourcis factorisée (une seule fonction pour tous les menus), suppression du code mort (`Select-AccountsInteractive`), script chargeable par dot-sourcing pour les tests.
 
 ## Nouveautés et corrections v3
 
@@ -431,7 +485,7 @@ En dépannage manuel : service WinRM démarré (`Enable-PSRemoting -Force`), rè
 
 ## Limites connues
 
-- Les contrôles et dates de fin de support sont **indicatifs** et datés : à confirmer (site *Lifecycle* Microsoft, rapport PingCastle complet). Le script ne remplace pas un audit PingCastle ni le jugement humain sur chaque remédiation.
+- Les contrôles et dates de fin de support sont **indicatifs** (table `$Script:OsLifecycle` à tenir à jour) : à confirmer (site *Lifecycle* Microsoft, rapport PingCastle complet). Le script ne remplace pas un audit PingCastle ni le jugement humain sur chaque remédiation.
 - La date d'introduction d'AES (groupe RODC) est une **approximation** ; en cas de doute, réinitialisez le mot de passe du compte avant de forcer AES uniquement.
 - Les paramètres appliqués directement au registre des DC (signature LDAP, audit NTLM, TLS...) sont **écrasés par une GPO** qui définirait les mêmes paramètres : le script le rappelle ; dans ce cas, modifiez la GPO.
 - Les droits utilisateur écrits dans une GPO dédiée (`2.4`) ne **fusionnent pas** avec ceux d'autres GPO : seule la GPO de plus haute priorité s'applique pour un même droit.
